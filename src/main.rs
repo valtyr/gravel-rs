@@ -1,6 +1,4 @@
 use esp_idf_svc::hal::prelude::Peripherals;
-use esp_idf_svc::bt::BtDriver;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use gravel_rs::controller::EspressoController;
 use log::info;
 use embassy_executor::Spawner;
@@ -18,16 +16,6 @@ async fn main(spawner: Spawner) {
 
     // Initialize peripherals
     let peripherals = Peripherals::take().unwrap();
-    let nvs = EspDefaultNvsPartition::take().unwrap();
-    
-    // Initialize Bluetooth
-    let bt_driver = match BtDriver::new(peripherals.modem, Some(nvs)) {
-        Ok(driver) => driver,
-        Err(e) => {
-            log::error!("Failed to initialize BT driver: {:?}", e);
-            return;
-        }
-    };
     
     // Create and start the controller
     let mut controller = match EspressoController::new(peripherals.pins.gpio19) {
@@ -41,7 +29,7 @@ async fn main(spawner: Spawner) {
     info!("Controller created successfully, starting...");
     
     // Start the controller with Embassy executor
-    if let Err(e) = controller.start(spawner, bt_driver).await {
+    if let Err(e) = controller.start(spawner).await {
         log::error!("Controller start failed: {:?}", e);
     }
 }

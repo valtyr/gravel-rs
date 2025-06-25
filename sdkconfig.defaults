@@ -1,5 +1,5 @@
 # Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16000
 
 # Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
 # This allows to use 1 ms granularity for thread sleeps (10 ms by default).
@@ -8,16 +8,27 @@ CONFIG_FREERTOS_HZ=1000
 # ESP32-C6 Configuration
 CONFIG_IDF_TARGET_ESP32C6=y
 
-# Enable BLE and Wi-Fi coexistence
+# Enable BLE for ESP32-C6 (both NimBLE and Bluedroid for flexibility)
 CONFIG_BT_ENABLED=y
-CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
-CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
-CONFIG_BTDM_CTRL_MODE_BTDM=n
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# Enable Bluedroid (required for esp-idf-svc::bt module)
 CONFIG_BT_BLUEDROID_ENABLED=y
 CONFIG_ESP_IDF_BT_ENABLED=y
 CONFIG_ESP_IDF_BT_BLUEDROID_ENABLED=y
+
+# Also enable NimBLE for potential future use
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# ESP32-C6 specific BLE controller settings
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_CTRL_BLE_MAX_CONN=1
+CONFIG_BT_CTRL_BLE_MAX_CONN_EFF=1
+
+# Memory optimizations for ESP32-C6
+CONFIG_BT_BLUEDROID_PINNED_TO_CORE_0=y
+CONFIG_BT_BTC_TASK_STACK_SIZE=3072
+CONFIG_BT_BTU_TASK_STACK_SIZE=4096
 
 # Wi-Fi Configuration
 CONFIG_ESP32_WIFI_ENABLED=y

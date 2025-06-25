@@ -82,6 +82,11 @@ This is a multi-threaded async application with several concurrent tasks:
 - **Weight Data**: 20-byte packets with XOR checksum
 - **Commands**: 6-byte command structure with XOR verification
 - **Connection**: Handle disconnects gracefully, implement reconnection logic
+- **esp32-nimble crate usage**: Use correct API patterns from source code examples:
+  - Scanning: `BLEScan::new()` then `start(&ble_device, duration_ms, callback)`
+  - Connecting: `BLEClient::new()` then `connect(&device_addr).await`
+  - Services: `client.get_service(uuid).await` (async!)
+  - Callback signature: `|device, data|` returns `Option<T>` to stop scan
 
 ### Testing and Debugging
 - Use serial console for real-time debugging (`log` crate)
@@ -138,3 +143,7 @@ This is a multi-threaded async application with several concurrent tasks:
 - Uses ESP-IDF's native logging facilities through `EspLogger::initialize_default()`
 - BLE and Wi-Fi coexistence requires proper configuration in `sdkconfig.defaults`
 - Embassy time driver integration requires careful task scheduling
+
+## Development Guidance
+
+- If you get stuck instead of reducing scope or stubbing things out, ask me for input
