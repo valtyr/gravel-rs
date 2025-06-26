@@ -6,6 +6,10 @@ pub const BLE_SERVICE_UUID: &str = "0000ffe0-0000-1000-8000-00805f9b34fb";
 pub const WEIGHT_CHAR_UUID: &str = "0000ff11-0000-1000-8000-00805f9b34fb";  
 pub const COMMAND_CHAR_UUID: &str = "0000ff12-0000-1000-8000-00805f9b34fb";
 
+// Convert UUID string to 16-bit UUID for BLE operations
+pub const WEIGHT_CHAR_UUID_16: u16 = 0xFF11;
+pub const COMMAND_CHAR_UUID_16: u16 = 0xFF12;
+
 pub const TARE_COMMAND: [u8; 6] = [0x03, 0x0A, 0x01, 0x00, 0x00, 0x08];
 pub const START_TIMER_COMMAND: [u8; 6] = [0x03, 0x0A, 0x04, 0x00, 0x00, 0x0A];
 pub const STOP_TIMER_COMMAND: [u8; 6] = [0x03, 0x0A, 0x05, 0x00, 0x00, 0x0D];
@@ -30,13 +34,17 @@ fn verify_checksum(data: &[u8]) -> bool {
 pub fn parse_scale_data(data: &[u8]) -> Option<ScaleData> {
     debug!("Parsing scale data: {:02X?}", data);
     
+    // Python implementation expects exactly 20 bytes with header [0x03, 0x0B]
     if data.len() != 20 {
-        warn!("Invalid data length: expected 20, got {}", data.len());
+        warn!("Invalid data length: expected 20, got {} (Python expects exactly 20)", data.len());
+        warn!("Received data: {:02X?}", data);
+        warn!("This suggests we're reading from the wrong characteristic - need to find 0xFF11 UUID");
         return None;
     }
     
     if data[0] != 0x03 || data[1] != 0x0B {
         warn!("Invalid header: expected [0x03, 0x0B], got [{:02X}, {:02X}]", data[0], data[1]);
+        warn!("This suggests we're reading from the wrong characteristic - need to find 0xFF11 UUID");
         return None;
     }
     
@@ -45,17 +53,23 @@ pub fn parse_scale_data(data: &[u8]) -> Option<ScaleData> {
         return None;
     }
     
-    let timestamp_ms = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    // Parse timestamp (3 bytes, big endian in Python implementation)
+    let timestamp_ms = ((data[2] as u32) << 16) | ((data[3] as u32) << 8) | (data[4] as u32);
     
-    let weight_raw = i16::from_le_bytes([data[6], data[7]]) as i32;
-    let weight_g = weight_raw as f32 / 100.0;
+    // Parse weight with sign (Python implementation)
+    let weight_sign = if data[6] == 0x2B { 1.0 } else { -1.0 }; // 0x2B = '+', 0x2D = '-'
+    let weight_raw = ((data[7] as u32) << 16) | ((data[8] as u32) << 8) | (data[9] as u32);
+    let weight_g = (weight_raw as f32 / 100.0) * weight_sign;
     
-    let flow_rate_raw = i16::from_le_bytes([data[8], data[9]]) as i32;
-    let flow_rate_g_per_s = flow_rate_raw as f32 / 100.0;
+    // Parse flow rate with sign (Python implementation)
+    let flow_sign = if data[10] == 0x2B { 1.0 } else { -1.0 }; // 0x2B = '+', 0x2D = '-'
+    let flow_raw = ((data[11] as u16) << 8) | (data[12] as u16);
+    let flow_rate_g_per_s = (flow_raw as f32 / 100.0) * flow_sign;
     
-    let battery_percent = data[10];
+    let battery_percent = data[13];
     
-    let timer_running = data[11] != 0;
+    // Assume timer is running if we're receiving data
+    let timer_running = true; // Python doesn't parse this field explicitly
     
     Some(ScaleData {
         timestamp_ms,
