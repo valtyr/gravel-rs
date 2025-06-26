@@ -1,10 +1,15 @@
 # Espresso Scale Controller
 
+> [!WARNING]  
+> I wanted to give vibe coding a try, so this whole thing was built by talking to Claude without ever opening an editor.  
+> Any jank you find is purely the AI's fault. I'm a real programmer, I swear.
+
 A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scale via BLE to control an espresso machine through a relay. This project provides predictive shot control, auto-taring, and a web interface for monitoring and configuration.
 
 ## Features
 
 ### Core Functionality
+
 - **BLE Scale Integration**: Connects to Bookoo Themis Mini scale using custom protocol
 - **Predictive Shot Control**: Uses flow rate data to predict optimal stop timing
 - **Auto-Tare System**: Automatically tares scale when objects are placed/removed
@@ -12,12 +17,14 @@ A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scal
 - **Safety Systems**: Multiple failsafes to prevent equipment damage
 
 ### Web Interface
+
 - **Real-time Monitoring**: Live weight, flow rate, and system status
 - **Configuration**: Adjust target weight, auto-tare, and other settings
 - **Manual Controls**: Tare scale, start/stop timer, test relay
 - **System Health**: BLE/Wi-Fi status, error messages, and logs
 
 ### Advanced Features
+
 - **Overshoot Learning**: Adaptive compensation for brewing delays
 - **State Management**: Comprehensive brewing state tracking
 - **Multi-tasking**: Concurrent BLE, Wi-Fi, and control operations
@@ -33,6 +40,7 @@ A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scal
 ## Setup Instructions
 
 ### 1. Environment Setup
+
 ```bash
 # Install Rust and ESP-IDF toolchain
 cargo install espup
@@ -44,12 +52,15 @@ cargo install cargo-espflash
 ```
 
 ### 2. Configuration
+
 Edit `sdkconfig.defaults` to configure:
+
 - Wi-Fi credentials (if using hardcoded values)
 - BLE parameters
 - Memory allocation settings
 
 ### 3. Build and Flash
+
 ```bash
 # Build the project
 cargo build --release
@@ -62,6 +73,7 @@ cargo espflash monitor --port /dev/ttyUSB0
 ```
 
 ### 4. Web Interface Access
+
 1. Find the ESP32-C6's IP address from serial output
 2. Open `http://[ESP_IP]:8081` in your browser
 3. The WebSocket connection uses port 8080
@@ -69,17 +81,20 @@ cargo espflash monitor --port /dev/ttyUSB0
 ## Usage
 
 ### Initial Setup
+
 1. Power on the ESP32-C6
 2. Ensure the Bookoo scale is discoverable (power cycle if needed)
 3. Access the web interface to configure settings
 
 ### Brewing Process
+
 1. Place cup on scale (auto-tare will activate)
 2. The system automatically detects timer start from scale
 3. Predictive stopping occurs based on flow rate analysis
 4. System returns to idle state after brewing
 
 ### Manual Controls
+
 - **Tare Scale**: Zero the scale reading
 - **Start/Stop Timer**: Manual timer control
 - **Test Relay**: Test GPIO relay functionality
@@ -89,6 +104,7 @@ cargo espflash monitor --port /dev/ttyUSB0
 ## Architecture
 
 ### Module Structure
+
 ```
 src/
 ├── main.rs           # Application entry point
@@ -116,6 +132,7 @@ src/
 **StateManager**: Centralized state management with thread-safe access
 
 ### Communication Flow
+
 1. BLE scale data → Protocol parsing → State updates
 2. State changes → Brewing logic → Relay control
 3. Web interface ← WebSocket ← State updates
@@ -130,6 +147,7 @@ The system implements the Bookoo Themis Mini's proprietary BLE protocol:
 - **Commands**: `0000ff12-0000-1000-8000-00805f9b34fb`
 
 ### Supported Commands
+
 - Tare: `[0x03, 0x0A, 0x01, 0x00, 0x00, 0x08]`
 - Start Timer: `[0x03, 0x0A, 0x04, 0x00, 0x00, 0x0A]`
 - Stop Timer: `[0x03, 0x0A, 0x05, 0x00, 0x00, 0x0D]`
@@ -138,12 +156,14 @@ The system implements the Bookoo Themis Mini's proprietary BLE protocol:
 ## Safety Features
 
 ### Critical Safety Systems
+
 1. **Emergency Stop**: Immediate relay shutdown on any fault
 2. **BLE Watchdog**: Monitors connection and data flow
 3. **Timer Validation**: Ensures relay state matches timer state
 4. **Error Recovery**: Automatic retry and graceful degradation
 
 ### Fail-Safe Conditions
+
 - BLE disconnection during brewing
 - Network connectivity loss
 - Data parsing errors
@@ -153,12 +173,14 @@ The system implements the Bookoo Themis Mini's proprietary BLE protocol:
 ## Configuration Options
 
 ### Default Settings
+
 - **Target Weight**: 36.0g
 - **Auto-Tare**: Enabled
 - **Predictive Stop**: Enabled
 - **Relay GPIO**: GPIO19 (active high)
 
 ### Adjustable Parameters
+
 - Target weight (1-100g)
 - Auto-tare sensitivity and timing
 - Predictive stop margins
@@ -167,12 +189,14 @@ The system implements the Bookoo Themis Mini's proprietary BLE protocol:
 ## Troubleshooting
 
 ### Common Issues
+
 1. **Scale Not Found**: Ensure scale is powered and in pairing mode
 2. **Web Interface Unreachable**: Check Wi-Fi connection and IP address
 3. **Relay Not Responding**: Check GPIO19 wiring and use test relay function
 4. **Predictive Stop Issues**: Reset overshoot learning data
 
 ### Debug Information
+
 - Serial console provides detailed logging
 - Web interface shows system status and recent log messages
 - BLE connection status and data flow indicators
@@ -180,6 +204,7 @@ The system implements the Bookoo Themis Mini's proprietary BLE protocol:
 ## Development
 
 ### Build Commands
+
 ```bash
 # Debug build
 cargo build
@@ -198,6 +223,7 @@ cargo clippy
 ```
 
 ### Testing
+
 ```bash
 # Run unit tests
 cargo test
