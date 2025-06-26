@@ -1,209 +1,111 @@
-use crate::types::{ScaleData, OVERSHOOT_HISTORY_SIZE, PREDICTION_SAFETY_MARGIN_G};
-use embassy_time::{Duration, Instant};
+use crate::types::{ScaleData, OVERSHOOT_HISTORY_SIZE};
+use embassy_time::{Duration, Instant, Timer};
 use log::{info, debug};
 use heapless::Vec;
 
 #[derive(Debug, Clone)]
 struct OvershootMeasurement {
-    predicted_stop_weight: f32,
-    actual_final_weight: f32,
     overshoot: f32,
     timestamp: Instant,
 }
 
 pub struct OvershootController {
+    stop_delay_ms: i32,
     overshoot_history: Vec<OvershootMeasurement, OVERSHOOT_HISTORY_SIZE>,
-    current_stop_delay_ms: i32,
-    last_prediction: Option<PredictionData>,
-    learning_enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PredictionData {
-    predicted_weight: f32,
-    prediction_time: Instant,
-    flow_rate: f32,
+    pending_predicted_stop: bool,
+    max_history_size: usize,
 }
 
 impl OvershootController {
     pub fn new() -> Self {
-        Self {
+        let controller = Self {
+            stop_delay_ms: 500, // Initial delay from Python
             overshoot_history: Vec::new(),
-            current_stop_delay_ms: 0,
-            last_prediction: None,
-            learning_enabled: true,
-        }
+            pending_predicted_stop: false,
+            max_history_size: 5,
+        };
+        
+        let (min_time, max_time) = controller.calculate_prediction_window();
+        info!("OvershootController initialized: delay={}ms, prediction_window=[{:.1}s, {:.1}s]", 
+              controller.stop_delay_ms, min_time, max_time);
+              
+        controller
     }
     
-    pub fn calculate_stop_timing(&mut self, 
-                                 current_weight: f32, 
-                                 target_weight: f32, 
-                                 flow_rate: f32) -> Option<StopTiming> {
-        if flow_rate <= 0.0 {
-            return None;
-        }
-        
-        let weight_to_target = target_weight - current_weight;
-        if weight_to_target <= 0.0 {
-            return Some(StopTiming {
-                should_stop_now: true,
-                delay_ms: 0,
-                predicted_final_weight: current_weight,
-            });
-        }
-        
-        let base_time_to_target_ms = (weight_to_target / flow_rate * 1000.0) as i32;
-        
-        let adjusted_delay = base_time_to_target_ms + self.current_stop_delay_ms;
-        
-        let predicted_final_weight = current_weight + (flow_rate * (adjusted_delay as f32 / 1000.0));
-        
-        let should_stop_now = adjusted_delay <= 0 || 
-                             predicted_final_weight >= (target_weight - PREDICTION_SAFETY_MARGIN_G);
-        
-        self.last_prediction = Some(PredictionData {
-            predicted_weight: predicted_final_weight,
-            prediction_time: Instant::now(),
-            flow_rate,
-        });
-        
-        debug!("Stop timing: weight={:.2}g, target={:.2}g, flow={:.2}g/s, delay={}ms, predicted={:.2}g",
-               current_weight, target_weight, flow_rate, adjusted_delay, predicted_final_weight);
-        
-        Some(StopTiming {
-            should_stop_now,
-            delay_ms: adjusted_delay.max(0),
-            predicted_final_weight,
-        })
+    /// Calculate valid prediction time window based on learned delay (from Python)
+    pub fn calculate_prediction_window(&self) -> (f32, f32) {
+        let min_reaction_time = (self.stop_delay_ms as f32 / 1000.0) + 0.2; // delay + safety margin
+        let max_prediction_time = min_reaction_time * 3.0; // Don't predict too far ahead
+        (min_reaction_time, max_prediction_time)
     }
     
-    pub fn record_actual_result(&mut self, final_weight: f32) {
-        if let Some(prediction) = &self.last_prediction {
-            let overshoot = final_weight - prediction.predicted_weight;
-            
-            let measurement = OvershootMeasurement {
-                predicted_stop_weight: prediction.predicted_weight,
-                actual_final_weight: final_weight,
-                overshoot,
-                timestamp: Instant::now(),
-            };
-            
-            info!("Overshoot measurement: predicted={:.2}g, actual={:.2}g, overshoot={:.2}g",
-                  prediction.predicted_weight, final_weight, overshoot);
-            
-            if self.overshoot_history.len() >= OVERSHOOT_HISTORY_SIZE {
-                self.overshoot_history.remove(0);
-            }
-            let _ = self.overshoot_history.push(measurement);
-            
-            if self.learning_enabled {
-                self.update_delay_compensation();
-            }
-        }
-        
-        self.last_prediction = None;
+    /// Get delay with overshoot compensation applied (from Python)
+    pub fn get_compensated_delay(&self, target_delay: f32) -> f32 {
+        (target_delay - (self.stop_delay_ms as f32 / 1000.0)).max(0.1)
     }
     
-    fn update_delay_compensation(&mut self) {
-        if self.overshoot_history.len() < 2 {
+    /// Mark that a predicted stop was initiated (from Python)
+    pub fn mark_predicted_stop(&mut self) {
+        self.pending_predicted_stop = true;
+    }
+    
+    /// Record overshoot and adjust delay if flow has stopped (from Python)
+    pub fn record_overshoot(&mut self, actual_weight: f32, target_weight: f32, flow_rate: f32) {
+        debug!("Overshoot check: pending={}, flow={:.2}g/s, weight={:.2}g, target={:.2}g", 
+               self.pending_predicted_stop, flow_rate, actual_weight, target_weight);
+               
+        if !self.pending_predicted_stop || flow_rate.abs() >= 0.5 {
             return;
         }
         
-        let total_overshoot: f32 = self.overshoot_history.iter()
-            .map(|m| m.overshoot)
-            .sum();
-        let avg_overshoot = total_overshoot / self.overshoot_history.len() as f32;
+        info!("Recording overshoot: flow stopped after predicted stop");
+        self.pending_predicted_stop = false;
+        let overshoot = actual_weight - target_weight;
         
-        const LEARNING_RATE: f32 = 0.5;
-        const MAX_ADJUSTMENT_MS: i32 = 100;
+        let measurement = OvershootMeasurement {
+            overshoot,
+            timestamp: Instant::now(),
+        };
         
-        let adjustment = (avg_overshoot * LEARNING_RATE * 1000.0) as i32;
-        let clamped_adjustment = adjustment.max(-MAX_ADJUSTMENT_MS).min(MAX_ADJUSTMENT_MS);
-        
-        let old_delay = self.current_stop_delay_ms;
-        self.current_stop_delay_ms -= clamped_adjustment;
-        
-        self.current_stop_delay_ms = self.current_stop_delay_ms.max(-500).min(500);
-        
-        if old_delay != self.current_stop_delay_ms {
-            info!("Updated stop delay: {}ms -> {}ms (avg overshoot: {:.2}g)",
-                  old_delay, self.current_stop_delay_ms, avg_overshoot);
+        // Keep only recent measurements
+        if self.overshoot_history.len() >= self.max_history_size {
+            self.overshoot_history.remove(0);
         }
+        let _ = self.overshoot_history.push(measurement);
+        
+        // Adjust delay based on average overshoot
+        let avg_overshoot = self.overshoot_history.iter()
+            .map(|m| m.overshoot)
+            .sum::<f32>() / self.overshoot_history.len() as f32;
+        
+        if avg_overshoot > 1.0 {
+            // Overshooting - stop earlier
+            self.stop_delay_ms += 100;
+        } else if avg_overshoot < -1.0 {
+            // Undershooting - stop later
+            self.stop_delay_ms = (self.stop_delay_ms - 100).max(100);
+        }
+        
+        info!("📊 Final overshoot: {:.1}g, Avg: {:.1}g, New delay: {}ms",
+              overshoot, avg_overshoot, self.stop_delay_ms);
     }
     
     pub fn get_current_delay_ms(&self) -> i32 {
-        self.current_stop_delay_ms
-    }
-    
-    pub fn get_average_overshoot(&self) -> Option<f32> {
-        if self.overshoot_history.is_empty() {
-            return None;
-        }
-        
-        let total: f32 = self.overshoot_history.iter()
-            .map(|m| m.overshoot)
-            .sum();
-        Some(total / self.overshoot_history.len() as f32)
+        self.stop_delay_ms
     }
     
     pub fn reset(&mut self) {
         info!("Resetting overshoot controller");
         self.overshoot_history.clear();
-        self.current_stop_delay_ms = 0;
-        self.last_prediction = None;
-    }
-    
-    pub fn set_learning_enabled(&mut self, enabled: bool) {
-        info!("Overshoot learning: {}", if enabled { "enabled" } else { "disabled" });
-        self.learning_enabled = enabled;
-    }
-    
-    pub fn get_overshoot_stats(&self) -> OvershootStats {
-        if self.overshoot_history.is_empty() {
-            return OvershootStats {
-                count: 0,
-                average: 0.0,
-                min: 0.0,
-                max: 0.0,
-                standard_deviation: 0.0,
-            };
-        }
-        
-        let overshoots: Vec<f32, OVERSHOOT_HISTORY_SIZE> = self.overshoot_history.iter()
-            .map(|m| m.overshoot)
-            .collect();
-        
-        let average = overshoots.iter().sum::<f32>() / overshoots.len() as f32;
-        let min = overshoots.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let max = overshoots.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        
-        let variance = overshoots.iter()
-            .map(|&x| (x - average).powi(2))
-            .sum::<f32>() / overshoots.len() as f32;
-        let standard_deviation = variance.sqrt();
-        
-        OvershootStats {
-            count: overshoots.len(),
-            average,
-            min,
-            max,
-            standard_deviation,
-        }
+        self.stop_delay_ms = 500;
+        self.pending_predicted_stop = false;
     }
 }
 
+// Simple structure for stop timing information
 #[derive(Debug, Clone)]
 pub struct StopTiming {
     pub should_stop_now: bool,
     pub delay_ms: i32,
     pub predicted_final_weight: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct OvershootStats {
-    pub count: usize,
-    pub average: f32,
-    pub min: f32,
-    pub max: f32,
-    pub standard_deviation: f32,
 }

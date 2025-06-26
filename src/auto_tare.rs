@@ -4,151 +4,205 @@ use log::{info, debug};
 use heapless::Vec;
 
 pub struct AutoTareController {
+    enabled: bool,
     state: AutoTareState,
+    stable_weight: f32,
     weight_history: Vec<f32, 10>,
     last_tare_time: Option<Instant>,
-    stability_count: usize,
-    last_stable_weight: Option<f32>,
+    empty_threshold: f32,
+    stable_readings_needed: usize,
+    brewing_cooldown_time: Option<Instant>, // Prevent auto-tare immediately after brewing
 }
 
 impl AutoTareController {
     pub fn new() -> Self {
         Self {
+            enabled: true,  // Default enabled like Python
             state: AutoTareState::Empty,
+            stable_weight: 0.0,
             weight_history: Vec::new(),
             last_tare_time: None,
-            stability_count: 0,
-            last_stable_weight: None,
+            empty_threshold: 2.0,  // From Python
+            stable_readings_needed: 5,  // From Python
+            brewing_cooldown_time: None,
         }
     }
     
-    pub fn update(&mut self, scale_data: &ScaleData, brew_state: BrewState) -> Option<TareAction> {
-        if brew_state != BrewState::Idle {
-            return None;
-        }
-        
-        if let Some(last_tare) = self.last_tare_time {
-            if Instant::now().duration_since(last_tare) < Duration::from_millis(TARE_COOLDOWN_MS) {
-                return None;
-            }
-        }
-        
-        self.update_weight_history(scale_data.weight_g);
-        
-        let action = match self.state {
-            AutoTareState::Empty => self.handle_empty_state(scale_data.weight_g),
-            AutoTareState::Loading => self.handle_loading_state(scale_data.weight_g),
-            AutoTareState::StableObject => self.handle_stable_object_state(scale_data.weight_g),
-            AutoTareState::Unloading => self.handle_unloading_state(scale_data.weight_g),
-        };
-        
-        debug!("AutoTare state: {:?}, weight: {:.2}g", self.state, scale_data.weight_g);
-        action
-    }
-    
-    fn update_weight_history(&mut self, weight: f32) {
-        if self.weight_history.len() >= 10 {
-            self.weight_history.remove(0);
-        }
-        let _ = self.weight_history.push(weight);
-    }
-    
-    fn is_weight_stable(&self) -> bool {
-        if self.weight_history.len() < TARE_STABILITY_COUNT {
+    /// Main auto-tare logic - called on every weight reading like Python
+    pub fn should_auto_tare(&mut self, scale_data: &ScaleData, brew_state: BrewState, timer_running: bool) -> bool {
+        if !self.enabled || timer_running || brew_state != BrewState::Idle {
             return false;
         }
         
-        let recent_weights = &self.weight_history[self.weight_history.len() - TARE_STABILITY_COUNT..];
-        let avg_weight: f32 = recent_weights.iter().sum::<f32>() / recent_weights.len() as f32;
-        
-        recent_weights.iter().all(|&w| (w - avg_weight).abs() < TARE_STABILITY_THRESHOLD_G)
-    }
-    
-    fn get_stable_weight(&self) -> Option<f32> {
-        if self.is_weight_stable() {
-            let recent_weights = &self.weight_history[self.weight_history.len() - TARE_STABILITY_COUNT..];
-            Some(recent_weights.iter().sum::<f32>() / recent_weights.len() as f32)
-        } else {
-            None
-        }
-    }
-    
-    fn handle_empty_state(&mut self, weight: f32) -> Option<TareAction> {
-        if weight > 2.0 {
-            info!("AutoTare: Detected object loading");
-            self.state = AutoTareState::Loading;
-            self.stability_count = 0;
-            
-            // Only trigger auto-tare if we've had a previous object that was removed
-            // This prevents taring on the very first object placement
-            if self.last_stable_weight.is_some() {
-                info!("AutoTare: New object detected after previous removal - triggering tare");
-                self.last_tare_time = Some(Instant::now());
-                return Some(TareAction::Tare);
-            }
-        }
-        None
-    }
-    
-    fn handle_loading_state(&mut self, weight: f32) -> Option<TareAction> {
-        if weight < 2.0 {
-            info!("AutoTare: Object removed during loading");
-            self.state = AutoTareState::Empty;
-            return None;
-        }
-        
-        if self.is_weight_stable() {
-            if let Some(stable_weight) = self.get_stable_weight() {
-                info!("AutoTare: Object stable at {:.2}g", stable_weight);
-                self.state = AutoTareState::StableObject;
-                self.last_stable_weight = Some(stable_weight);
+        // Check brewing cooldown period (prevent auto-tare right after brewing)
+        if let Some(brewing_cooldown) = self.brewing_cooldown_time {
+            if Instant::now().duration_since(brewing_cooldown) < Duration::from_secs(10) {
+                debug!("Auto-tare: Still in brewing cooldown period");
+                return false;
             }
         }
         
-        None
-    }
-    
-    fn handle_stable_object_state(&mut self, weight: f32) -> Option<TareAction> {
-        if let Some(stable_weight) = self.last_stable_weight {
-            if (weight - stable_weight).abs() > 5.0 {
-                if weight < stable_weight - 5.0 {
-                    info!("AutoTare: Object being removed");
-                    self.state = AutoTareState::Unloading;
-                } else {
-                    info!("AutoTare: Significant weight change, new object detected");
+        // Check regular tare cooldown period
+        if let Some(last_tare) = self.last_tare_time {
+            if Instant::now().duration_since(last_tare) < Duration::from_millis(TARE_COOLDOWN_MS) {
+                return false;
+            }
+        }
+        
+        let current_weight = scale_data.weight_g;
+        let is_stable = self.is_weight_stable(current_weight);
+        let is_empty = current_weight.abs() <= self.empty_threshold;
+        
+        // State machine logic from Python
+        match self.state {
+            AutoTareState::Empty => {
+                if !is_empty && is_stable {
+                    // Object placed on empty scale - TARE IMMEDIATELY
+                    self.state = AutoTareState::StableObject;
+                    self.stable_weight = current_weight;
+                    info!("AutoTare: Object detected: {:.1}g - TARING", current_weight);
+                    return true;
+                } else if !is_empty {
+                    // Weight detected but not stable yet
                     self.state = AutoTareState::Loading;
-                    self.stability_count = 0;
+                }
+            }
+            
+            AutoTareState::Loading => {
+                if is_stable {
+                    if is_empty {
+                        // Stabilized to empty
+                        self.state = AutoTareState::Empty;
+                        self.stable_weight = 0.0;
+                    } else {
+                        // Stabilized with object - TARE IMMEDIATELY
+                        self.state = AutoTareState::StableObject;
+                        self.stable_weight = current_weight;
+                        info!("AutoTare: Object stabilized: {:.1}g - TARING", current_weight);
+                        return true;
+                    }
+                }
+            }
+            
+            AutoTareState::StableObject => {
+                if is_empty && is_stable {
+                    // Object removed - NO TARE, just go to Empty
+                    self.state = AutoTareState::Empty;
+                    self.stable_weight = 0.0;
+                    info!("AutoTare: Object removed");
+                } else if is_stable && (current_weight - self.stable_weight).abs() > 10.0 {
+                    // MAJOR weight change - definitely cup swap (increased threshold to 10.0g for real-world use)
+                    // Reset to Empty to force proper detection (NO IMMEDIATE TARE)
+                    self.state = AutoTareState::Empty;
+                    self.stable_weight = 0.0;
+                    info!("AutoTare: Major cup change detected: {:.1}g -> {:.1}g", self.stable_weight, current_weight);
+                } else if !is_stable {
+                    // Weight changing - but only go to unloading if it's a significant change
+                    // Small fluctuations after brewing shouldn't trigger unloading state
+                    let recent_avg = if self.weight_history.len() >= 3 {
+                        let recent: f32 = self.weight_history[self.weight_history.len() - 3..]
+                            .iter().sum::<f32>() / 3.0;
+                        recent
+                    } else {
+                        current_weight
+                    };
+                    
+                    if (recent_avg - self.stable_weight).abs() > 5.0 {
+                        info!("AutoTare: Major weight change detected, entering unloading state");
+                        self.state = AutoTareState::Unloading;
+                    }
+                    // Otherwise stay in StableObject state for small fluctuations
+                }
+            }
+            
+            AutoTareState::Unloading => {
+                if is_stable {
+                    if is_empty {
+                        // Removed completely
+                        self.state = AutoTareState::Empty;
+                        self.stable_weight = 0.0;
+                        info!("AutoTare: Object removed");
+                    } else {
+                        // Stabilized at new weight - TARE IMMEDIATELY
+                        self.state = AutoTareState::StableObject;
+                        let old_weight = self.stable_weight;
+                        self.stable_weight = current_weight;
+                        info!("AutoTare: Object changed: {:.1}g → {:.1}g - TARING", old_weight, current_weight);
+                        return true;
+                    }
                 }
             }
         }
-        None
+        
+        false
     }
     
-    fn handle_unloading_state(&mut self, weight: f32) -> Option<TareAction> {
-        if weight < 2.0 {
-            info!("AutoTare: Object completely removed - ready for new cup taring");
-            self.state = AutoTareState::Empty;
-            // Keep last_stable_weight to remember we had an object - needed for next auto-tare
-        } else if weight > (self.last_stable_weight.unwrap_or(0.0) - 2.0) {
-            info!("AutoTare: Object placed back");
-            self.state = AutoTareState::StableObject;
+    fn is_weight_stable(&mut self, current_weight: f32) -> bool {
+        // Add to history
+        if self.weight_history.len() >= 10 {
+            self.weight_history.remove(0);
         }
-        None
+        let _ = self.weight_history.push(current_weight);
+        
+        // Need at least stable_readings_needed readings
+        if self.weight_history.len() < self.stable_readings_needed {
+            return false;
+        }
+        
+        // Use more robust stability detection - check both range and trend
+        let recent_weights = &self.weight_history[self.weight_history.len() - self.stable_readings_needed..];
+        
+        // Calculate average and check if all readings are close to average (more robust than min/max)
+        let avg_weight: f32 = recent_weights.iter().sum::<f32>() / recent_weights.len() as f32;
+        let max_deviation = recent_weights.iter()
+            .map(|&w| (w - avg_weight).abs())
+            .fold(0.0f32, |a, b| a.max(b));
+        
+        // Consider stable if max deviation from average is within threshold
+        // This is more robust against single outlier readings
+        max_deviation <= TARE_STABILITY_THRESHOLD_G
+    }
+    
+    pub fn record_tare(&mut self) {
+        self.last_tare_time = Some(Instant::now());
     }
     
     pub fn get_state(&self) -> AutoTareState {
         self.state
     }
     
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+    
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+    
     pub fn reset(&mut self) {
         self.state = AutoTareState::Empty;
         self.weight_history.clear();
-        self.stability_count = 0;
-        self.last_stable_weight = None;
+        self.stable_weight = 0.0;
+    }
+    
+    /// Called when returning to idle after brewing - preserves current object state
+    pub fn brewing_finished(&mut self, current_weight: f32) {
+        // Set brewing cooldown to prevent auto-tare for 10 seconds after brewing
+        self.brewing_cooldown_time = Some(Instant::now());
+        
+        // If we have a stable object after brewing, keep it as stable without re-taring
+        if current_weight > self.empty_threshold {
+            info!("AutoTare: Brewing finished, preserving object at {:.1}g (10s cooldown active)", current_weight);
+            self.state = AutoTareState::StableObject;
+            self.stable_weight = current_weight;
+            // Clear weight history to rebuild stability for this object
+            self.weight_history.clear();
+        } else {
+            info!("AutoTare: Brewing finished, scale empty");
+            self.state = AutoTareState::Empty;
+            self.stable_weight = 0.0;
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum TareAction {
-    Tare,
-}
+// Remove the TareAction enum - we'll use bool directly like Python

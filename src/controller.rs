@@ -1,5 +1,5 @@
 use crate::{
-    auto_tare::{AutoTareController, TareAction},
+    auto_tare::AutoTareController,
     ble::StatusChannel,
     bookoo_scale::{BookooScale, ScaleDataChannel},
     brew_states::{BrewStateMachine, BrewStateTransition},
@@ -45,8 +45,8 @@ pub struct EspressoController {
     websocket_command_channel: Arc<WebSocketCommandChannel>,
     scale_command_channel: Arc<ScaleCommandChannel>,
 
-    last_stop_prediction: Option<StopTiming>,
-    prediction_timer_start: Option<Instant>,
+    // Predictive stopping state (Python style)
+    pending_stop_time: Option<Instant>,
     
     // Timer detection state (from Python reference)
     last_timer_ms: Option<u32>,
@@ -56,9 +56,13 @@ pub struct EspressoController {
     // Scale shutdown detection to prevent false brewing triggers
     timer_start_time: Option<Instant>, // When timer was started
     consecutive_disconnection_count: u32, // Count BLE disconnections after timer start
+    relay_startup_delay: Option<Instant>, // Delay relay start to detect false timer starts
     
     // Brewing startup delay to ignore button press artifacts
     brew_start_time: Option<Instant>,
+    
+    // Flag to handle auto-tare after brewing finishes
+    just_finished_brewing: bool,
 }
 
 impl EspressoController {
@@ -99,8 +103,8 @@ impl EspressoController {
             websocket_command_channel,
             scale_command_channel,
 
-            last_stop_prediction: None,
-            prediction_timer_start: None,
+            // Predictive stopping
+            pending_stop_time: None,
             
             // Timer detection state
             last_timer_ms: None,
@@ -110,9 +114,13 @@ impl EspressoController {
             // Scale shutdown detection
             timer_start_time: None,
             consecutive_disconnection_count: 0,
+            relay_startup_delay: None,
             
             // Brewing startup delay
             brew_start_time: None,
+            
+            // Auto-tare state
+            just_finished_brewing: false,
         })
     }
 
@@ -202,13 +210,34 @@ impl EspressoController {
             self.handle_brew_state_transition(transition).await;
         }
 
+        // Handle auto-tare logic - call on every weight reading like Python
         if self.state_manager.is_auto_tare_enabled().await {
-            if let Some(action) = self
-                .auto_tare_controller
-                .update(&scale_data, self.state_manager.get_brew_state().await)
-            {
-                self.handle_auto_tare_action(action).await;
+            let brew_state = self.state_manager.get_brew_state().await;
+            let timer_state = self.state_manager.get_timer_state().await;
+            let timer_running = timer_state == TimerState::Running;
+            
+            // If we just finished brewing, inform auto-tare controller to preserve current object
+            if self.just_finished_brewing && brew_state == BrewState::Idle {
+                self.auto_tare_controller.brewing_finished(scale_data.weight_g);
+                self.just_finished_brewing = false;
             }
+            
+            if self.auto_tare_controller.should_auto_tare(&scale_data, brew_state, timer_running) {
+                info!("Auto-tare triggered - taring scale at {:.1}g", scale_data.weight_g);
+                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::Tare) {
+                    warn!("Failed to send auto-tare command - channel full");
+                } else {
+                    self.auto_tare_controller.record_tare();
+                    
+                    // Reset timer if needed (like Python)
+                    if scale_data.timestamp_ms > 0 {
+                        if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::ResetTimer) {
+                            warn!("Failed to send reset timer command - channel full");
+                        }
+                    }
+                }
+            }
+            
             self.state_manager
                 .update_auto_tare_state(self.auto_tare_controller.get_state())
                 .await;
@@ -236,54 +265,97 @@ impl EspressoController {
 
         let target_weight = self.state_manager.get_target_weight().await;
 
-        if let Some(timing) = self.overshoot_controller.calculate_stop_timing(
-            scale_data.weight_g,
-            target_weight,
-            scale_data.flow_rate_g_per_s,
-        ) {
-            if timing.should_stop_now && self.last_stop_prediction.is_none() {
+        // Handle auto-stop logic like Python
+        self.handle_auto_stop(scale_data, target_weight).await;
+        
+        // Record overshoot when flow stops after predicted stop
+        self.overshoot_controller.record_overshoot(
+            scale_data.weight_g, 
+            target_weight, 
+            scale_data.flow_rate_g_per_s
+        );
+    }
+    
+    /// Handle automatic stopping logic (from Python)
+    async fn handle_auto_stop(&mut self, scale_data: &ScaleData, target_weight: f32) {
+        // Target reached (with startup delay)
+        if scale_data.weight_g >= target_weight && scale_data.timestamp_ms > 1000 {
+            info!(
+                "🎯 Target reached: {:.1}g >= {:.1}g at {}ms",
+                scale_data.weight_g,
+                target_weight,
+                scale_data.timestamp_ms
+            );
+            if let Err(e) = self.stop_brewing_with_reason("target_reached").await {
+                error!("Failed to stop brewing: {:?}", e);
+                self.emergency_stop().await;
+            }
+            return;
+        }
+
+        // Predictive stopping (after startup period) - Python algorithm
+        if scale_data.flow_rate_g_per_s > 0.0 && scale_data.timestamp_ms > 2000 {
+            let weight_needed = target_weight - scale_data.weight_g;
+            let time_to_target = weight_needed / scale_data.flow_rate_g_per_s;
+
+            let (min_time, max_time) = self.overshoot_controller.calculate_prediction_window();
+
+            // COMPREHENSIVE DEBUG LOGGING
+            debug!(
+                "PREDICTION CHECK: weight={:.1}g, target={:.1}g, needed={:.1}g, flow={:.1}g/s, time_to_target={:.1}s, window=[{:.1}s, {:.1}s], delay={}ms", 
+                scale_data.weight_g, target_weight, weight_needed, scale_data.flow_rate_g_per_s, 
+                time_to_target, min_time, max_time, self.overshoot_controller.get_current_delay_ms()
+            );
+
+            if min_time < time_to_target && time_to_target <= max_time {
+                // Cancel existing prediction
+                if self.pending_stop_time.is_some() {
+                    info!("Cancelling previous prediction");
+                }
+
                 info!(
-                    "Predictive stop triggered at {:.2}g (target: {:.2}g, predicted: {:.2}g)",
-                    scale_data.weight_g, target_weight, timing.predicted_final_weight
+                    "🎯 PREDICTION TRIGGERED: target in {:.1}s, scheduling stop...", 
+                    time_to_target
                 );
-
-                if let Err(e) = self.stop_brewing().await {
-                    error!("Failed to stop brewing: {:?}", e);
-                    self.emergency_stop().await;
-                } else {
-                    self.last_stop_prediction = Some(timing);
-                    self.prediction_timer_start = Some(Instant::now());
+                
+                // Start delayed stop task
+                self.schedule_delayed_stop(time_to_target).await;
+            } else {
+                // Log why prediction didn't trigger
+                if time_to_target <= min_time {
+                    debug!("Prediction rejected: time_to_target {:.1}s <= min_time {:.1}s (too close)", time_to_target, min_time);
+                } else if time_to_target > max_time {
+                    debug!("Prediction rejected: time_to_target {:.1}s > max_time {:.1}s (too far)", time_to_target, max_time);
                 }
             }
-        }
-
-        if let Some(prediction_start) = self.prediction_timer_start {
-            if Instant::now().duration_since(prediction_start) > Duration::from_secs(10) {
-                if let Some(prediction) = &self.last_stop_prediction {
-                    self.overshoot_controller
-                        .record_actual_result(scale_data.weight_g);
-                    info!(
-                        "Recorded final weight for overshoot learning: {:.2}g",
-                        scale_data.weight_g
-                    );
-                }
-                self.last_stop_prediction = None;
-                self.prediction_timer_start = None;
+        } else {
+            // Log why predictive logic was skipped
+            if scale_data.flow_rate_g_per_s <= 0.0 {
+                debug!("Prediction skipped: flow_rate {:.1}g/s <= 0", scale_data.flow_rate_g_per_s);
+            } else if scale_data.timestamp_ms <= 2000 {
+                debug!("Prediction skipped: timestamp {}ms <= 2000ms (startup period)", scale_data.timestamp_ms);
             }
         }
+    }
+    
+    /// Schedule a delayed stop (Python equivalent of asyncio.create_task)
+    async fn schedule_delayed_stop(&mut self, delay_seconds: f32) {
+        let compensated_delay = self.overshoot_controller.get_compensated_delay(delay_seconds);
+        let delay_duration = Duration::from_millis((compensated_delay * 1000.0) as u64);
+        
+        self.pending_stop_time = Some(Instant::now() + delay_duration);
+        
+        info!("⏰ SCHEDULED STOP: in {:.1}s (compensated from {:.1}s), executing at {:?}", 
+               compensated_delay, delay_seconds, self.pending_stop_time.unwrap());
     }
 
     async fn handle_brew_state_transition(&mut self, transition: BrewStateTransition) {
         match (transition.from, transition.to) {
             (BrewState::Idle, BrewState::Brewing) => {
-                info!("Brewing started - ignoring weight measurements for 2 seconds");
+                info!("Brewing started - delaying relay 1 second to confirm not scale shutdown");
                 self.brew_start_time = Some(Instant::now());
-                if let Err(e) = self.relay_controller.turn_on().await {
-                    error!("Failed to turn on relay: {:?}", e);
-                    self.emergency_stop().await;
-                } else {
-                    self.state_manager.set_relay_enabled(true).await;
-                }
+                // Delay relay activation to detect false timer starts (scale shutdown)
+                self.relay_startup_delay = Some(Instant::now() + Duration::from_millis(1000));
             }
             (BrewState::Brewing, BrewState::BrewSettling) => {
                 info!("Brewing finished, settling");
@@ -296,29 +368,38 @@ impl EspressoController {
             }
             (BrewState::BrewSettling, BrewState::Idle) => {
                 info!("Returned to idle state");
-                self.auto_tare_controller.reset();
+                // Mark that we just finished brewing so auto-tare can preserve current object
+                self.just_finished_brewing = true;
             }
             _ => {}
         }
     }
 
-    async fn handle_auto_tare_action(&mut self, action: TareAction) {
-        match action {
-            TareAction::Tare => {
-                info!("Auto-tare triggered");
-                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::Tare) {
-                    warn!("Failed to send auto-tare command - channel full");
-                }
-            }
-        }
-    }
 
     async fn handle_ble_status_change(&mut self, connected: bool) {
         self.state_manager.set_ble_connected(connected).await;
 
         if !connected {
-            // Check if disconnection happened shortly after timer start - indicates scale shutdown
-            if let Some(timer_start) = self.timer_start_time {
+            // Check if disconnection happened during relay delay - indicates scale shutdown
+            if self.relay_startup_delay.is_some() {
+                info!("🚨 BLE DISCONNECTED during relay delay - SCALE SHUTDOWN DETECTED!");
+                self.relay_startup_delay = None; // Cancel relay activation
+                
+                // Clean up brewing state
+                if self.current_timer_running {
+                    self.current_timer_running = false;
+                    self.state_manager.update_timer_state(TimerState::Idle).await;
+                }
+                
+                // Return to idle without ever turning on relay
+                self.brew_state_machine.force_idle();
+                self.state_manager.update_brew_state(BrewState::Idle).await;
+                self.consecutive_disconnection_count += 1;
+                
+                info!("Scale shutdown handled gracefully - relay never activated");
+            }
+            // Check if disconnection happened shortly after timer start - indicates scale shutdown  
+            else if let Some(timer_start) = self.timer_start_time {
                 let elapsed = Instant::now().duration_since(timer_start);
                 if elapsed < Duration::from_secs(3) { // 3 second window
                     self.consecutive_disconnection_count += 1;
@@ -457,19 +538,72 @@ impl EspressoController {
 
         self.safety_controller
             .update_relay_state(current_state.relay_enabled);
+            
+        // Check for pending predictive stop (like Python's delayed task)
+        if let Some(stop_time) = self.pending_stop_time {
+            if Instant::now() >= stop_time {
+                info!("⏰ EXECUTING DELAYED PREDICTIVE STOP (scheduled for {:?})", stop_time);
+                self.pending_stop_time = None;
+                
+                if self.state_manager.get_timer_state().await == TimerState::Running {
+                    if let Err(e) = self.stop_brewing_with_reason("predicted").await {
+                        error!("Failed to execute predictive stop: {:?}", e);
+                        self.emergency_stop().await;
+                    }
+                } else {
+                    info!("Predictive stop cancelled - timer no longer running");
+                }
+            }
+        }
+        
+        // Check for delayed relay activation (after confirming not scale shutdown)
+        if let Some(relay_time) = self.relay_startup_delay {
+            if Instant::now() >= relay_time {
+                info!("🔥 ACTIVATING RELAY after 1s delay - confirmed real brewing");
+                self.relay_startup_delay = None;
+                
+                if self.state_manager.get_brew_state().await == BrewState::Brewing {
+                    if let Err(e) = self.relay_controller.turn_on().await {
+                        error!("Failed to turn on relay: {:?}", e);
+                        self.emergency_stop().await;
+                    } else {
+                        self.state_manager.set_relay_enabled(true).await;
+                    }
+                } else {
+                    info!("Relay activation cancelled - no longer brewing");
+                }
+            }
+        }
     }
 
     async fn stop_brewing(&mut self) -> Result<(), RelayError> {
-        info!("Stopping brewing");
+        self.stop_brewing_with_reason("manual").await
+    }
+    
+    async fn stop_brewing_with_reason(&mut self, reason: &str) -> Result<(), RelayError> {
+        info!("Stopping brewing ({})", reason);
 
-        if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::StopTimer) {
-            warn!("Failed to send stop timer command - channel full");
+        // Cancel pending stop task
+        if self.pending_stop_time.is_some() {
+            self.pending_stop_time = None;
+        }
+
+        // Mark predicted stop if this was automatic
+        if reason == "predicted" {
+            self.overshoot_controller.mark_predicted_stop();
+        }
+
+        // Send stop command for automatic stops (like Python)
+        if reason == "target_reached" || reason == "predicted" {
+            if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::StopTimer) {
+                warn!("Failed to send stop timer command - channel full");
+            }
         }
 
         self.relay_controller.turn_off().await?;
         self.state_manager.set_relay_enabled(false).await;
         self.state_manager
-            .add_log("Brewing stopped".to_string())
+            .add_log(format!("Brewing stopped ({})", reason))
             .await;
 
         Ok(())
@@ -479,6 +613,9 @@ impl EspressoController {
         error!("EMERGENCY STOP ACTIVATED");
 
         self.brew_start_time = None; // Clear startup delay
+        self.relay_startup_delay = None; // Cancel any pending relay activation
+        self.pending_stop_time = None; // Cancel any pending predictive stops
+        
         self.safety_controller
             .handle_emergency_stop(&mut self.relay_controller);
         self.state_manager.set_relay_enabled(false).await;
@@ -524,6 +661,23 @@ impl EspressoController {
                 info!("Ignoring timer start - likely scale shutdown sequence (disconnection count: {})", 
                      self.consecutive_disconnection_count);
                 self.consecutive_disconnection_count = 0;
+                return;
+            }
+            
+            // Additional shutdown detection: if weight jumps dramatically with very high flow rate,
+            // this is likely the shutdown sequence where scale readings go crazy before disconnecting
+            if scale_data.flow_rate_g_per_s > 50.0 {
+                info!("Ignoring timer start - extreme flow rate {:.1}g/s indicates scale shutdown sequence", 
+                     scale_data.flow_rate_g_per_s);
+                // Don't set timer running, just wait for disconnect
+                return;
+            }
+            
+            // Also check for rapid weight increases that are physically impossible during normal brewing
+            // Lower threshold to catch more shutdown sequences
+            if scale_data.flow_rate_g_per_s > 25.0 {
+                info!("Ignoring timer start - high flow rate {:.1}g/s indicates scale shutdown sequence", 
+                     scale_data.flow_rate_g_per_s);
                 return;
             }
             

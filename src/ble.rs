@@ -201,6 +201,26 @@ impl BleClient {
         filter: Option<DeviceFilter>,
         duration_ms: u32,
     ) -> Result<Vec<Device>, BleError> {
+        self.scan_for_devices_internal(filter, duration_ms, false).await
+    }
+    
+    /// Scan for the first matching device and return immediately
+    pub async fn scan_for_first_device(
+        &self,
+        filter: Option<DeviceFilter>,
+        duration_ms: u32,
+    ) -> Result<Option<Device>, BleError> {
+        let devices = self.scan_for_devices_internal(filter, duration_ms, true).await?;
+        Ok(devices.into_iter().next())
+    }
+    
+    /// Internal scan implementation with early termination option
+    async fn scan_for_devices_internal(
+        &self,
+        filter: Option<DeviceFilter>,
+        duration_ms: u32,
+        return_first: bool,
+    ) -> Result<Vec<Device>, BleError> {
         info!("Starting BLE scan for {} ms", duration_ms);
 
         // Reset scan state
@@ -241,7 +261,7 @@ impl BleClient {
             }
         }
 
-        // Wait for scan to complete
+        // Wait for scan to complete or first device if requested
         let timeout_ms = duration_ms + 1000; // Add 1 second buffer
         let mut elapsed_ms = 0;
 
@@ -249,7 +269,17 @@ impl BleClient {
             Timer::after(Duration::from_millis(100)).await;
             elapsed_ms += 100;
 
-            if *SCAN_COMPLETE.lock().unwrap() || elapsed_ms > timeout_ms {
+            let scan_complete = *SCAN_COMPLETE.lock().unwrap();
+            let found_device = if return_first {
+                !FOUND_DEVICES.lock().unwrap().is_empty()
+            } else {
+                false
+            };
+
+            if scan_complete || found_device || elapsed_ms > timeout_ms {
+                if found_device && !scan_complete {
+                    info!("Found target device early - stopping scan at {}ms", elapsed_ms);
+                }
                 break;
             }
         }

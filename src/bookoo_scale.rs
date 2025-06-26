@@ -196,7 +196,7 @@ impl BookooScale {
         Ok(())
     }
 
-    /// Scan for Bookoo scale devices
+    /// Scan for Bookoo scale devices - connect immediately when found
     async fn find_scale(&self) -> Result<Device, ScaleError> {
         info!("Scanning for Bookoo scale...");
 
@@ -205,15 +205,15 @@ impl BookooScale {
             service_uuid: None,
         };
 
-        let devices = self
+        // Use early termination scan to connect immediately when scale is found
+        if let Some(device) = self
             .ble_client
-            .scan_for_devices(Some(filter), 10000)
-            .await?;
-
-        for device in devices {
+            .scan_for_first_device(Some(filter), 10000)
+            .await? 
+        {
             if let Some(ref name) = device.name {
                 if name.starts_with("BOOKOO_SC") {
-                    info!("Found Bookoo scale: {}", name);
+                    info!("Found Bookoo scale immediately: {}", name);
                     return Ok(device);
                 }
             }
