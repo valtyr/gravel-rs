@@ -1,10 +1,17 @@
 # Espresso Scale Controller
 
 > [!WARNING]  
-> I wanted to give vibe coding a try, so this whole thing was built by talking to Claude without ever opening an editor.  
-> Any jank you find is purely the AI's fault. I'm a real programmer, I swear.
+> I wanted to give vibe coding a try, so this whole thing (including the README.md) was built by talking to Claude without ever opening an editor. Any jank you find is purely the AI's fault. I'm a real programmer, I swear.
 
-A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scale via BLE to control an espresso machine through a relay. This project provides predictive shot control, auto-taring, and a web interface for monitoring and configuration.
+## About
+
+This project retrofits a Stone Plus espresso machine with a Bookoo Themis Mini scale and an ESP32-C6 board to enable fully automated, weight-based shot control.
+
+A custom wiring harness taps into the brew switch in parallel—so the machine works normally when the ESP isn’t powered or the scale is off. The mod is clean, 100% reversible, and driven entirely by software.
+
+It uses BLE to get live weight and flow data from the scale, and drives a relay to start/stop brewing. The whole thing runs async in Rust, with a web UI for real-time control and configuration.
+
+Why? Because you deserve better espresso.
 
 ## Features
 
@@ -13,8 +20,7 @@ A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scal
 - **BLE Scale Integration**: Connects to Bookoo Themis Mini scale using custom protocol
 - **Predictive Shot Control**: Uses flow rate data to predict optimal stop timing
 - **Auto-Tare System**: Automatically tares scale when objects are placed/removed
-- **Relay Control**: Direct GPIO control (GPIO19) for espresso machine
-- **Safety Systems**: Multiple failsafes to prevent equipment damage
+- **Overshoot Learning**: Adaptive compensation for brewing delays
 
 ### Web Interface
 
@@ -25,7 +31,6 @@ A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scal
 
 ### Advanced Features
 
-- **Overshoot Learning**: Adaptive compensation for brewing delays
 - **State Management**: Comprehensive brewing state tracking
 - **Multi-tasking**: Concurrent BLE, Wi-Fi, and control operations
 - **Robust Error Handling**: Graceful degradation and recovery
@@ -37,7 +42,44 @@ A Rust-based ESP32-C6 application that interfaces with a Bookoo Themis Mini scal
 - **Relay module** connected to GPIO19 (active high) for espresso machine control
 - **Wi-Fi network** for web interface access
 
-## Setup Instructions
+## Wiring Diagram
+
+Below is a schematic representation of the custom wiring harness that enables parallel control of the brew switch:
+
+<img src="images/harness.svg" alt="Wiring Harness" width="700" />
+
+The harness is inserted between the espresso machine’s brew switch and its controller using standard blade connectors:
+
+- `STONE_CTRL_*_IN`: Male blade connectors to the espresso machine's original brew switch terminals
+- `BREW_SWITCH_*_OUT`: Female blade connectors that reconnect to the brew switch
+- `RELAY_*_OUT`: Bare wires that connect to the ESP32-driven relay's NO/COM terminals
+
+This setup ensures that the machine functions normally even if the ESP is unpowered or the scale is disconnected. The modification is 100% reversible and operates entirely at low voltage (5V), so light-gauge wire is sufficient.
+
+## Usage
+
+### Initial Setup
+
+1. Power on the ESP32-C6
+2. Ensure the Bookoo scale is discoverable (power cycle if needed)
+3. Access the web interface to configure settings
+
+### Brewing Process
+
+1. Place cup on scale (auto-tare will activate)
+2. The system automatically detects timer start from scale
+3. Predictive stopping occurs based on flow rate analysis
+4. System returns to idle state after brewing
+
+### Manual Controls
+
+- **Tare Scale**: Zero the scale reading
+- **Start/Stop Timer**: Manual timer control
+- **Test Relay**: Test GPIO relay functionality
+- **Reset Overshoot**: Clear adaptive learning data
+- **Configuration**: Adjust target weight and auto-tare settings
+
+## Development Setup Instructions
 
 ### 1. Environment Setup
 
@@ -78,29 +120,6 @@ cargo espflash monitor --port /dev/ttyUSB0
 2. Open `http://[ESP_IP]:8081` in your browser
 3. The WebSocket connection uses port 8080
 
-## Usage
-
-### Initial Setup
-
-1. Power on the ESP32-C6
-2. Ensure the Bookoo scale is discoverable (power cycle if needed)
-3. Access the web interface to configure settings
-
-### Brewing Process
-
-1. Place cup on scale (auto-tare will activate)
-2. The system automatically detects timer start from scale
-3. Predictive stopping occurs based on flow rate analysis
-4. System returns to idle state after brewing
-
-### Manual Controls
-
-- **Tare Scale**: Zero the scale reading
-- **Start/Stop Timer**: Manual timer control
-- **Test Relay**: Test GPIO relay functionality
-- **Reset Overshoot**: Clear adaptive learning data
-- **Configuration**: Adjust target weight and auto-tare settings
-
 ## Architecture
 
 ### Module Structure
@@ -124,12 +143,14 @@ src/
 
 ### Key Components
 
-**EspressoController**: Main orchestrator managing all subsystems
-**BleScaleClient**: Handles BLE connection and protocol communication
-**WebSocketServer**: Provides real-time web interface
-**RelayController**: Manages GPIO-based relay control (GPIO19)
-**SafetyController**: Implements multiple safety mechanisms
-**StateManager**: Centralized state management with thread-safe access
+| Component            | Description                                          |
+| -------------------- | ---------------------------------------------------- |
+| `EspressoController` | Main orchestrator managing all subsystems            |
+| `BleScaleClient`     | Handles BLE connection and protocol communication    |
+| `WebSocketServer`    | Provides real-time web interface                     |
+| `RelayController`    | Manages GPIO-based relay control (GPIO19)            |
+| `SafetyController`   | Implements multiple safety mechanisms                |
+| `StateManager`       | Centralized state management with thread-safe access |
 
 ### Communication Flow
 
