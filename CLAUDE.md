@@ -147,3 +147,7 @@ This is a multi-threaded async application with several concurrent tasks:
 ## Development Guidance
 
 - If you get stuck instead of reducing scope or stubbing things out, ask me for input
+
+## Best Practices
+
+- Keep track of todos in a TODOS.md that you keep updated and refer to. This makes sure you aren't limited by context size

@@ -90,8 +90,10 @@ impl EspressoController {
             .spawn(ble_task(ble_client))
             .map_err(|_| "Failed to spawn BLE task")?;
 
-        // // Spawn WebSocket/HTTP server task
-        // spawner.spawn(websocket_task(websocket_server)).map_err(|_| "Failed to spawn WebSocket task")?;
+        // Spawn WebSocket/HTTP server task (non-fatal if it fails)
+        if let Err(_) = spawner.spawn(websocket_task(websocket_server)) {
+            warn!("Failed to spawn WebSocket task - continuing without HTTP server");
+        }
 
         // Run the main control loop
         self.main_control_loop().await;
@@ -430,6 +432,9 @@ async fn ble_task(ble_client: BleScaleClient) {
 async fn websocket_task(websocket_server: WebSocketServer) {
     info!("WebSocket/HTTP task started");
     if let Err(e) = websocket_server.start().await {
-        error!("WebSocket task error: {:?}", e);
+        warn!("WebSocket/HTTP server failed to start: {:?} - continuing without web interface", e);
+        // Return instead of panicking - BLE functionality can continue
+    } else {
+        info!("WebSocket/HTTP server started successfully");
     }
 }
