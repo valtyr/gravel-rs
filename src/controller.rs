@@ -1,6 +1,7 @@
 use crate::{
     auto_tare::{AutoTareController, TareAction},
-    ble::{BleScaleClient, BleStatusChannel, ScaleDataChannel},
+    ble::StatusChannel,
+    bookoo_scale::{BookooScale, ScaleDataChannel},
     brew_states::{BrewStateMachine, BrewStateTransition},
     overshoot::{OvershootController, StopTiming},
     relay::{RelayController, RelayError},
@@ -18,9 +19,20 @@ use esp_idf_svc::hal::gpio::Gpio19;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
 
+// Scale command types for BLE command channel
+#[derive(Debug, Clone)]
+pub enum ScaleCommand {
+    Tare,
+    StartTimer,
+    StopTimer,
+    ResetTimer,
+}
+
+pub type ScaleCommandChannel = Channel<CriticalSectionRawMutex, ScaleCommand, 5>;
+
 pub struct EspressoController {
     state_manager: StateManager,
-    ble_client: BleScaleClient,
+    scale_client: BookooScale,
     websocket_server: WebSocketServer,
     relay_controller: RelayController,
     safety_controller: SafetyController,
@@ -29,11 +41,24 @@ pub struct EspressoController {
     overshoot_controller: OvershootController,
 
     scale_data_channel: Arc<ScaleDataChannel>,
-    ble_status_channel: Arc<BleStatusChannel>,
+    ble_status_channel: Arc<StatusChannel>,
     websocket_command_channel: Arc<WebSocketCommandChannel>,
+    scale_command_channel: Arc<ScaleCommandChannel>,
 
     last_stop_prediction: Option<StopTiming>,
     prediction_timer_start: Option<Instant>,
+    
+    // Timer detection state (from Python reference)
+    last_timer_ms: Option<u32>,
+    current_timer_running: bool,
+    timer_frozen_count: u32, // Count how many packets timestamp has been frozen
+    
+    // Scale shutdown detection to prevent false brewing triggers
+    timer_start_time: Option<Instant>, // When timer was started
+    consecutive_disconnection_count: u32, // Count BLE disconnections after timer start
+    
+    // Brewing startup delay to ignore button press artifacts
+    brew_start_time: Option<Instant>,
 }
 
 impl EspressoController {
@@ -41,11 +66,12 @@ impl EspressoController {
         let scale_data_channel = Arc::new(Channel::new());
         let ble_status_channel = Arc::new(Channel::new());
         let websocket_command_channel = Arc::new(Channel::new());
+        let scale_command_channel = Arc::new(Channel::new());
 
         let state_manager = StateManager::new();
         let state_handle = state_manager.get_state_handle();
 
-        let ble_client = BleScaleClient::new(
+        let scale_client = BookooScale::new(
             Arc::clone(&scale_data_channel),
             Arc::clone(&ble_status_channel),
         );
@@ -60,7 +86,7 @@ impl EspressoController {
 
         Ok(Self {
             state_manager,
-            ble_client,
+            scale_client,
             websocket_server,
             relay_controller,
             safety_controller: SafetyController::new(),
@@ -71,24 +97,45 @@ impl EspressoController {
             scale_data_channel,
             ble_status_channel,
             websocket_command_channel,
+            scale_command_channel,
 
             last_stop_prediction: None,
             prediction_timer_start: None,
+            
+            // Timer detection state
+            last_timer_ms: None,
+            current_timer_running: false,
+            timer_frozen_count: 0,
+            
+            // Scale shutdown detection
+            timer_start_time: None,
+            consecutive_disconnection_count: 0,
+            
+            // Brewing startup delay
+            brew_start_time: None,
         })
     }
 
     pub async fn start(&mut self, spawner: Spawner) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting Espresso Controller with Embassy tasks");
 
-        // Clone references for the tasks
-        let ble_client = self.ble_client.clone();
+        // Initialize BLE stack
+        BookooScale::initialize()?;
+
+        // Clone references for the tasks  
         let websocket_server = self.websocket_server.clone();
         let _state_handle = self.state_manager.get_state_handle();
 
-        // Spawn BLE task
+        // Create a new scale client for the task (since tasks own their data)
+        let scale_client = BookooScale::new(
+            Arc::clone(&self.scale_data_channel),
+            Arc::clone(&self.ble_status_channel),
+        );
+
+        // Spawn scale task with command channel
         spawner
-            .spawn(ble_task(ble_client))
-            .map_err(|_| "Failed to spawn BLE task")?;
+            .spawn(scale_task(scale_client, Arc::clone(&self.scale_command_channel)))
+            .map_err(|_| "Failed to spawn scale task")?;
 
         // Spawn WebSocket/HTTP server task (non-fatal if it fails)
         if let Err(_) = spawner.spawn(websocket_task(websocket_server)) {
@@ -135,8 +182,8 @@ impl EspressoController {
 
     async fn handle_scale_data(&mut self, scale_data: ScaleData) {
         debug!(
-            "Received scale data: {:.2}g, {:.2}g/s",
-            scale_data.weight_g, scale_data.flow_rate_g_per_s
+            "Received scale data: {:.2}g, {:.2}g/s, timestamp: {}ms",
+            scale_data.weight_g, scale_data.flow_rate_g_per_s, scale_data.timestamp_ms
         );
 
         self.safety_controller.update_data_received();
@@ -144,19 +191,8 @@ impl EspressoController {
             .update_scale_data(scale_data.clone())
             .await;
 
-        if scale_data.timer_running {
-            if self.state_manager.get_timer_state().await != TimerState::Running {
-                self.state_manager
-                    .update_timer_state(TimerState::Running)
-                    .await;
-            }
-        } else {
-            if self.state_manager.get_timer_state().await == TimerState::Running {
-                self.state_manager
-                    .update_timer_state(TimerState::Idle)
-                    .await;
-            }
-        }
+        // Handle timer detection using Python reference logic
+        self.handle_timer_detection(&scale_data).await;
 
         if let Some(transition) = self
             .brew_state_machine
@@ -186,6 +222,16 @@ impl EspressoController {
     async fn handle_brewing_logic(&mut self, scale_data: &ScaleData) {
         if !self.state_manager.is_predictive_stop_enabled().await {
             return;
+        }
+
+        // Skip predictive logic during startup delay (button press artifacts)
+        if let Some(brew_start) = self.brew_start_time {
+            let elapsed = Instant::now().duration_since(brew_start);
+            if elapsed < Duration::from_millis(2000) { // 2 second delay
+                debug!("Ignoring weight measurement during startup delay: {:.2}g ({}ms elapsed)", 
+                       scale_data.weight_g, elapsed.as_millis());
+                return;
+            }
         }
 
         let target_weight = self.state_manager.get_target_weight().await;
@@ -230,7 +276,8 @@ impl EspressoController {
     async fn handle_brew_state_transition(&mut self, transition: BrewStateTransition) {
         match (transition.from, transition.to) {
             (BrewState::Idle, BrewState::Brewing) => {
-                info!("Brewing started");
+                info!("Brewing started - ignoring weight measurements for 2 seconds");
+                self.brew_start_time = Some(Instant::now());
                 if let Err(e) = self.relay_controller.turn_on().await {
                     error!("Failed to turn on relay: {:?}", e);
                     self.emergency_stop().await;
@@ -240,6 +287,7 @@ impl EspressoController {
             }
             (BrewState::Brewing, BrewState::BrewSettling) => {
                 info!("Brewing finished, settling");
+                self.brew_start_time = None; // Clear startup delay
                 if let Err(e) = self.relay_controller.turn_off().await {
                     error!("Failed to turn off relay: {:?}", e);
                 } else {
@@ -258,8 +306,8 @@ impl EspressoController {
         match action {
             TareAction::Tare => {
                 info!("Auto-tare triggered");
-                if let Err(e) = self.ble_client.send_tare_command().await {
-                    warn!("Failed to send auto-tare command: {:?}", e);
+                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::Tare) {
+                    warn!("Failed to send auto-tare command - channel full");
                 }
             }
         }
@@ -269,10 +317,39 @@ impl EspressoController {
         self.state_manager.set_ble_connected(connected).await;
 
         if !connected {
+            // Check if disconnection happened shortly after timer start - indicates scale shutdown
+            if let Some(timer_start) = self.timer_start_time {
+                let elapsed = Instant::now().duration_since(timer_start);
+                if elapsed < Duration::from_secs(3) { // 3 second window
+                    self.consecutive_disconnection_count += 1;
+                    info!("BLE disconnected {}ms after timer start - potential scale shutdown (count: {})", 
+                         elapsed.as_millis(), self.consecutive_disconnection_count);
+                    
+                    // If timer is running and we disconnect quickly, likely a shutdown - stop the timer
+                    if self.current_timer_running {
+                        info!("Scale shutdown detected - stopping timer");
+                        self.current_timer_running = false;
+                        self.state_manager.update_timer_state(TimerState::Idle).await;
+                        
+                        // Emergency stop if brewing was triggered
+                        if self.state_manager.get_brew_state().await != BrewState::Idle {
+                            info!("Emergency stop due to scale shutdown during brewing");
+                            self.emergency_stop().await;
+                        }
+                    }
+                } else {
+                    // Reset disconnection count if enough time has passed
+                    self.consecutive_disconnection_count = 0;
+                }
+            }
+            
             self.state_manager
                 .set_error(Some("BLE disconnected".to_string()))
                 .await;
         } else {
+            // Reset disconnection tracking on successful connection
+            self.consecutive_disconnection_count = 0;
+            self.timer_start_time = None;
             self.state_manager.set_error(None).await;
         }
     }
@@ -322,24 +399,24 @@ impl EspressoController {
             }
 
             WebSocketCommand::TareScale => {
-                if let Err(e) = self.ble_client.send_tare_command().await {
-                    warn!("Failed to send tare command: {:?}", e);
+                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::Tare) {
+                    warn!("Failed to send tare command - channel full");
                     self.state_manager
-                        .add_log("Failed to tare scale".to_string())
+                        .add_log("Failed to send tare command".to_string())
                         .await;
                 } else {
                     self.state_manager
-                        .add_log("Scale tared manually".to_string())
+                        .add_log("Tare command sent to scale".to_string())
                         .await;
                 }
             }
 
             WebSocketCommand::StartTimer => {
-                if let Err(e) = self.ble_client.send_start_timer_command().await {
-                    warn!("Failed to send start timer command: {:?}", e);
+                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::StartTimer) {
+                    warn!("Failed to send start timer command - channel full");
                 } else {
                     self.state_manager
-                        .add_log("Timer started manually".to_string())
+                        .add_log("Start timer command sent to scale".to_string())
                         .await;
                 }
             }
@@ -351,11 +428,11 @@ impl EspressoController {
             }
 
             WebSocketCommand::ResetTimer => {
-                if let Err(e) = self.ble_client.send_reset_timer_command().await {
-                    warn!("Failed to send reset timer command: {:?}", e);
+                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::ResetTimer) {
+                    warn!("Failed to send reset timer command - channel full");
                 } else {
                     self.state_manager
-                        .add_log("Timer reset manually".to_string())
+                        .add_log("Reset timer command sent to scale".to_string())
                         .await;
                 }
                 self.brew_state_machine.force_idle();
@@ -385,8 +462,8 @@ impl EspressoController {
     async fn stop_brewing(&mut self) -> Result<(), RelayError> {
         info!("Stopping brewing");
 
-        if let Err(e) = self.ble_client.send_stop_timer_command().await {
-            warn!("Failed to send stop timer command: {:?}", e);
+        if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::StopTimer) {
+            warn!("Failed to send stop timer command - channel full");
         }
 
         self.relay_controller.turn_off().await?;
@@ -401,6 +478,7 @@ impl EspressoController {
     async fn emergency_stop(&mut self) {
         error!("EMERGENCY STOP ACTIVATED");
 
+        self.brew_start_time = None; // Clear startup delay
         self.safety_controller
             .handle_emergency_stop(&mut self.relay_controller);
         self.state_manager.set_relay_enabled(false).await;
@@ -417,14 +495,70 @@ impl EspressoController {
             .update_timer_state(TimerState::Idle)
             .await;
     }
+
+    /// Handle timer state detection from scale data (Python reference implementation)
+    async fn handle_timer_detection(&mut self, scale_data: &ScaleData) {
+        if self.last_timer_ms.is_none() {
+            self.last_timer_ms = Some(scale_data.timestamp_ms);
+            self.timer_frozen_count = 0;
+            return;
+        }
+
+        let last_timer_ms = self.last_timer_ms.unwrap();
+
+        // Check if timestamp is changing
+        if scale_data.timestamp_ms == last_timer_ms {
+            self.timer_frozen_count += 1;
+        } else {
+            self.timer_frozen_count = 0;
+        }
+
+        // Timer started: not running + timestamp > 0 + timestamp > last_timestamp
+        if !self.current_timer_running 
+            && scale_data.timestamp_ms > 0 
+            && scale_data.timestamp_ms > last_timer_ms {
+            
+            // Check if this could be a scale shutdown (timer start followed by immediate disconnection)
+            // If we've had recent disconnections after a timer start, ignore this timer start
+            if self.consecutive_disconnection_count > 0 {
+                info!("Ignoring timer start - likely scale shutdown sequence (disconnection count: {})", 
+                     self.consecutive_disconnection_count);
+                self.consecutive_disconnection_count = 0;
+                return;
+            }
+            
+            info!("Timer started detected: {}ms -> {}ms", last_timer_ms, scale_data.timestamp_ms);
+            self.current_timer_running = true;
+            self.timer_frozen_count = 0;
+            self.timer_start_time = Some(Instant::now());
+            self.state_manager.update_timer_state(TimerState::Running).await;
+        }
+        
+        // Timer stopped: running + timestamp has been frozen for several packets
+        else if self.current_timer_running && self.timer_frozen_count >= 3 {
+            if scale_data.timestamp_ms == 0 {
+                info!("Timer reset detected: timestamp -> 0");
+            } else {
+                info!("Timer stopped detected: timestamp frozen at {}ms for {} packets", 
+                     scale_data.timestamp_ms, self.timer_frozen_count);
+            }
+            self.current_timer_running = false;
+            self.state_manager.update_timer_state(TimerState::Idle).await;
+        }
+
+        // Update last timestamp
+        self.last_timer_ms = Some(scale_data.timestamp_ms);
+    }
 }
 
 // Embassy task functions
 #[embassy_executor::task]
-async fn ble_task(ble_client: BleScaleClient) {
-    info!("BLE task started");
-    if let Err(e) = ble_client.start().await {
-        error!("BLE task error: {:?}", e);
+async fn scale_task(mut scale_client: BookooScale, command_channel: Arc<ScaleCommandChannel>) {
+    info!("Scale task started with command channel");
+    
+    // Start scale client with command channel support
+    if let Err(e) = scale_client.start_with_commands(command_channel).await {
+        error!("Scale task error: {:?}", e);
     }
 }
 

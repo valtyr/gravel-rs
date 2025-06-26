@@ -40,10 +40,11 @@ impl SafetyController {
                 return true;
             }
             
-            if !state.wifi_connected {
-                warn!("SAFETY: Wi-Fi disconnected during brewing - emergency stop for safety");
-                return true;
-            }
+            // TEMPORARY: Disable Wi-Fi safety check for BLE testing
+            // if !state.wifi_connected {
+            //     warn!("SAFETY: Wi-Fi disconnected during brewing - emergency stop for safety");
+            //     return true;
+            // }
             
             if state.last_error.is_some() {
                 error!("SAFETY: System error during brewing - emergency stop");

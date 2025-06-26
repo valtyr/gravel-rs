@@ -1,5 +1,6 @@
 pub mod ble;
 pub mod ble_bindings;
+pub mod bookoo_scale;
 pub mod websocket;
 pub mod relay;
 pub mod state;

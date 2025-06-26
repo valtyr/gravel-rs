@@ -68,8 +68,10 @@ pub fn parse_scale_data(data: &[u8]) -> Option<ScaleData> {
     
     let battery_percent = data[13];
     
-    // Assume timer is running if we're receiving data
-    let timer_running = true; // Python doesn't parse this field explicitly
+    // Timer state is determined by analyzing timestamp changes over time,
+    // not from a specific byte. This should be handled in the controller.
+    // For now, parse the raw timestamp and let the controller determine timer state.
+    let timer_running = timestamp_ms > 0; // Basic heuristic: timer running if timestamp > 0
     
     Some(ScaleData {
         timestamp_ms,

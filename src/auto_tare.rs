@@ -78,6 +78,14 @@ impl AutoTareController {
             info!("AutoTare: Detected object loading");
             self.state = AutoTareState::Loading;
             self.stability_count = 0;
+            
+            // Only trigger auto-tare if we've had a previous object that was removed
+            // This prevents taring on the very first object placement
+            if self.last_stable_weight.is_some() {
+                info!("AutoTare: New object detected after previous removal - triggering tare");
+                self.last_tare_time = Some(Instant::now());
+                return Some(TareAction::Tare);
+            }
         }
         None
     }
@@ -94,9 +102,6 @@ impl AutoTareController {
                 info!("AutoTare: Object stable at {:.2}g", stable_weight);
                 self.state = AutoTareState::StableObject;
                 self.last_stable_weight = Some(stable_weight);
-                
-                self.last_tare_time = Some(Instant::now());
-                return Some(TareAction::Tare);
             }
         }
         
@@ -121,9 +126,9 @@ impl AutoTareController {
     
     fn handle_unloading_state(&mut self, weight: f32) -> Option<TareAction> {
         if weight < 2.0 {
-            info!("AutoTare: Object completely removed");
+            info!("AutoTare: Object completely removed - ready for new cup taring");
             self.state = AutoTareState::Empty;
-            self.last_stable_weight = None;
+            // Keep last_stable_weight to remember we had an object - needed for next auto-tare
         } else if weight > (self.last_stable_weight.unwrap_or(0.0) - 2.0) {
             info!("AutoTare: Object placed back");
             self.state = AutoTareState::StableObject;

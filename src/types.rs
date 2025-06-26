@@ -91,6 +91,6 @@ pub struct WebSocketMessage {
 pub const TARE_STABILITY_THRESHOLD_G: f32 = 0.5;
 pub const TARE_STABILITY_COUNT: usize = 5;
 pub const TARE_COOLDOWN_MS: u64 = 2000;
-pub const BREW_SETTLING_TIMEOUT_MS: u64 = 30000;
+pub const BREW_SETTLING_TIMEOUT_MS: u64 = 2000; // 2 seconds settling time
 pub const OVERSHOOT_HISTORY_SIZE: usize = 5;
-pub const PREDICTION_SAFETY_MARGIN_G: f32 = 0.5;
+pub const PREDICTION_SAFETY_MARGIN_G: f32 = 2.0; // Increased from 0.5g to prevent early stops
