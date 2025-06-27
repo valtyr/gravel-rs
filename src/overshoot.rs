@@ -54,7 +54,13 @@ impl OvershootController {
         debug!("Overshoot check: pending={}, flow={:.2}g/s, weight={:.2}g, target={:.2}g", 
                self.pending_predicted_stop, flow_rate, actual_weight, target_weight);
                
-        if !self.pending_predicted_stop || flow_rate.abs() >= 0.5 {
+        if !self.pending_predicted_stop {
+            debug!("Overshoot: No pending predicted stop - skipping");
+            return;
+        }
+        
+        if flow_rate.abs() >= 0.5 {
+            debug!("Overshoot: Flow rate {:.2}g/s >= 0.5g/s - waiting for flow to stop", flow_rate);
             return;
         }
         

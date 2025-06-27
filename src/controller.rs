@@ -51,12 +51,10 @@ pub struct EspressoController {
     // Timer detection state (from Python reference)
     last_timer_ms: Option<u32>,
     current_timer_running: bool,
-    timer_frozen_count: u32, // Count how many packets timestamp has been frozen
     
     // Scale shutdown detection to prevent false brewing triggers
     timer_start_time: Option<Instant>, // When timer was started
     consecutive_disconnection_count: u32, // Count BLE disconnections after timer start
-    relay_startup_delay: Option<Instant>, // Delay relay start to detect false timer starts
     
     // Brewing startup delay to ignore button press artifacts
     brew_start_time: Option<Instant>,
@@ -109,12 +107,10 @@ impl EspressoController {
             // Timer detection state
             last_timer_ms: None,
             current_timer_running: false,
-            timer_frozen_count: 0,
             
             // Scale shutdown detection
             timer_start_time: None,
             consecutive_disconnection_count: 0,
-            relay_startup_delay: None,
             
             // Brewing startup delay
             brew_start_time: None,
@@ -352,10 +348,16 @@ impl EspressoController {
     async fn handle_brew_state_transition(&mut self, transition: BrewStateTransition) {
         match (transition.from, transition.to) {
             (BrewState::Idle, BrewState::Brewing) => {
-                info!("Brewing started - delaying relay 1 second to confirm not scale shutdown");
+                info!("🔥 Brewing started - activating relay immediately (robust timer detection)");
                 self.brew_start_time = Some(Instant::now());
-                // Delay relay activation to detect false timer starts (scale shutdown)
-                self.relay_startup_delay = Some(Instant::now() + Duration::from_millis(1000));
+                
+                // Activate relay immediately - no delay needed with proper timer detection
+                if let Err(e) = self.relay_controller.turn_on().await {
+                    error!("Failed to turn on relay: {:?}", e);
+                    self.emergency_stop().await;
+                } else {
+                    self.state_manager.set_relay_enabled(true).await;
+                }
             }
             (BrewState::Brewing, BrewState::BrewSettling) => {
                 info!("Brewing finished, settling");
@@ -380,26 +382,8 @@ impl EspressoController {
         self.state_manager.set_ble_connected(connected).await;
 
         if !connected {
-            // Check if disconnection happened during relay delay - indicates scale shutdown
-            if self.relay_startup_delay.is_some() {
-                info!("🚨 BLE DISCONNECTED during relay delay - SCALE SHUTDOWN DETECTED!");
-                self.relay_startup_delay = None; // Cancel relay activation
-                
-                // Clean up brewing state
-                if self.current_timer_running {
-                    self.current_timer_running = false;
-                    self.state_manager.update_timer_state(TimerState::Idle).await;
-                }
-                
-                // Return to idle without ever turning on relay
-                self.brew_state_machine.force_idle();
-                self.state_manager.update_brew_state(BrewState::Idle).await;
-                self.consecutive_disconnection_count += 1;
-                
-                info!("Scale shutdown handled gracefully - relay never activated");
-            }
             // Check if disconnection happened shortly after timer start - indicates scale shutdown  
-            else if let Some(timer_start) = self.timer_start_time {
+            if let Some(timer_start) = self.timer_start_time {
                 let elapsed = Instant::now().duration_since(timer_start);
                 if elapsed < Duration::from_secs(3) { // 3 second window
                     self.consecutive_disconnection_count += 1;
@@ -555,25 +539,6 @@ impl EspressoController {
                 }
             }
         }
-        
-        // Check for delayed relay activation (after confirming not scale shutdown)
-        if let Some(relay_time) = self.relay_startup_delay {
-            if Instant::now() >= relay_time {
-                info!("🔥 ACTIVATING RELAY after 1s delay - confirmed real brewing");
-                self.relay_startup_delay = None;
-                
-                if self.state_manager.get_brew_state().await == BrewState::Brewing {
-                    if let Err(e) = self.relay_controller.turn_on().await {
-                        error!("Failed to turn on relay: {:?}", e);
-                        self.emergency_stop().await;
-                    } else {
-                        self.state_manager.set_relay_enabled(true).await;
-                    }
-                } else {
-                    info!("Relay activation cancelled - no longer brewing");
-                }
-            }
-        }
     }
 
     async fn stop_brewing(&mut self) -> Result<(), RelayError> {
@@ -588,8 +553,12 @@ impl EspressoController {
             self.pending_stop_time = None;
         }
 
-        // Mark predicted stop if this was automatic
+        // Mark predicted stop if this was automatic - also mark for target_reached if there was a pending prediction
         if reason == "predicted" {
+            self.overshoot_controller.mark_predicted_stop();
+        } else if reason == "target_reached" && self.pending_stop_time.is_some() {
+            // Target was reached but we had a prediction scheduled - still count as predicted stop for learning
+            info!("🎯 Target reached with pending prediction - marking for overshoot learning");
             self.overshoot_controller.mark_predicted_stop();
         }
 
@@ -613,7 +582,6 @@ impl EspressoController {
         error!("EMERGENCY STOP ACTIVATED");
 
         self.brew_start_time = None; // Clear startup delay
-        self.relay_startup_delay = None; // Cancel any pending relay activation
         self.pending_stop_time = None; // Cancel any pending predictive stops
         
         self.safety_controller
@@ -637,18 +605,10 @@ impl EspressoController {
     async fn handle_timer_detection(&mut self, scale_data: &ScaleData) {
         if self.last_timer_ms.is_none() {
             self.last_timer_ms = Some(scale_data.timestamp_ms);
-            self.timer_frozen_count = 0;
             return;
         }
 
         let last_timer_ms = self.last_timer_ms.unwrap();
-
-        // Check if timestamp is changing
-        if scale_data.timestamp_ms == last_timer_ms {
-            self.timer_frozen_count += 1;
-        } else {
-            self.timer_frozen_count = 0;
-        }
 
         // Timer started: not running + timestamp > 0 + timestamp > last_timestamp
         if !self.current_timer_running 
@@ -683,24 +643,27 @@ impl EspressoController {
             
             info!("Timer started detected: {}ms -> {}ms", last_timer_ms, scale_data.timestamp_ms);
             self.current_timer_running = true;
-            self.timer_frozen_count = 0;
             self.timer_start_time = Some(Instant::now());
             self.state_manager.update_timer_state(TimerState::Running).await;
         }
         
-        // Timer stopped: running + timestamp has been frozen for several packets
-        else if self.current_timer_running && self.timer_frozen_count >= 3 {
-            if scale_data.timestamp_ms == 0 {
-                info!("Timer reset detected: timestamp -> 0");
-            } else {
-                info!("Timer stopped detected: timestamp frozen at {}ms for {} packets", 
-                     scale_data.timestamp_ms, self.timer_frozen_count);
-            }
+        // Timer stopped manually - IMMEDIATE DETECTION LIKE PYTHON
+        else if self.current_timer_running 
+            && scale_data.timestamp_ms == last_timer_ms 
+            && scale_data.timestamp_ms > 0 {
+            info!("⏹️ Timer stopped manually: timestamp frozen at {}ms (IMMEDIATE DETECTION)", scale_data.timestamp_ms);
+            self.current_timer_running = false;
+            self.state_manager.update_timer_state(TimerState::Idle).await;
+        }
+        
+        // Timer reset
+        else if self.current_timer_running && scale_data.timestamp_ms == 0 {
+            info!("Timer reset detected: timestamp -> 0");
             self.current_timer_running = false;
             self.state_manager.update_timer_state(TimerState::Idle).await;
         }
 
-        // Update last timestamp
+        // Update last timestamp - AFTER detection logic like Python
         self.last_timer_ms = Some(scale_data.timestamp_ms);
     }
 }

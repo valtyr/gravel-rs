@@ -88,7 +88,7 @@ pub struct WebSocketMessage {
 }
 
 
-pub const TARE_STABILITY_THRESHOLD_G: f32 = 1.0; // Increased from 0.5g to 1.0g for real-world noise
+pub const TARE_STABILITY_THRESHOLD_G: f32 = 0.5; // Match Python implementation for faster cup removal detection
 pub const TARE_STABILITY_COUNT: usize = 5;
 pub const TARE_COOLDOWN_MS: u64 = 2000;
 pub const BREW_SETTLING_TIMEOUT_MS: u64 = 2000; // 2 seconds settling time

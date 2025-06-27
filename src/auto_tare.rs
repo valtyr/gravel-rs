@@ -149,18 +149,15 @@ impl AutoTareController {
             return false;
         }
         
-        // Use more robust stability detection - check both range and trend
+        // Use Python's simple min/max approach for consistent behavior
         let recent_weights = &self.weight_history[self.weight_history.len() - self.stable_readings_needed..];
         
-        // Calculate average and check if all readings are close to average (more robust than min/max)
-        let avg_weight: f32 = recent_weights.iter().sum::<f32>() / recent_weights.len() as f32;
-        let max_deviation = recent_weights.iter()
-            .map(|&w| (w - avg_weight).abs())
-            .fold(0.0f32, |a, b| a.max(b));
+        // Check if recent weights are within threshold of each other (Python method)
+        let max_weight = recent_weights.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let min_weight = recent_weights.iter().fold(f32::INFINITY, |a, &b| a.min(b));
         
-        // Consider stable if max deviation from average is within threshold
-        // This is more robust against single outlier readings
-        max_deviation <= TARE_STABILITY_THRESHOLD_G
+        // Consider stable if range is within threshold (exactly like Python)
+        (max_weight - min_weight) <= TARE_STABILITY_THRESHOLD_G
     }
     
     pub fn record_tare(&mut self) {
