@@ -518,6 +518,11 @@ impl BleClient {
         NOTIFICATION_DATA.lock().unwrap().take()
     }
 
+    /// Check if currently connected to a BLE device
+    pub fn is_connected(&self) -> bool {
+        *CONNECTED.lock().unwrap()
+    }
+
     /// Write data to a characteristic
     pub async fn write_characteristic(
         &self,

@@ -1,9 +1,8 @@
 use esp_idf_svc::hal::prelude::Peripherals;
-use esp_idf_svc::wifi::{EspWifi, BlockingWifi};
-use esp_idf_svc::wifi::Configuration;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use gravel_rs::controller::EspressoController;
+use gravel_rs::wifi_manager::WifiManager;
 use log::info;
 use embassy_executor::Spawner;
 
@@ -21,20 +20,36 @@ async fn main(spawner: Spawner) {
     // Initialize peripherals
     let peripherals = Peripherals::take().unwrap();
     
-    // Initialize networking stack (required for HTTP server)
+    // Initialize networking stack with WiFi provisioning
     let nvs = EspDefaultNvsPartition::take().unwrap();
     let sys_loop = EspSystemEventLoop::take().unwrap();
     
-    info!("Initializing Wi-Fi for networking stack...");
-    let _wifi = match initialize_wifi(peripherals.modem, nvs, sys_loop) {
-        Ok(wifi) => {
-            info!("Wi-Fi stack initialized successfully");
-            Some(wifi)
+    info!("Initializing WiFi Manager with BLE provisioning...");
+    let mut wifi_manager = match WifiManager::new(peripherals.modem, sys_loop, nvs).await {
+        Ok(manager) => {
+            info!("WiFi Manager initialized successfully");
+            Some(manager)
         }
         Err(e) => {
-            log::warn!("Wi-Fi initialization failed: {:?} - HTTP server may not work", e);
+            log::warn!("WiFi Manager initialization failed: {:?} - continuing without WiFi", e);
             None
         }
+    };
+    
+    // Start WiFi (provisioning or connection)
+    let (wifi_connected, ble_needs_reset) = if let Some(ref mut manager) = wifi_manager {
+        match manager.start().await {
+            Ok((connected, needs_reset)) => {
+                info!("📶 WiFi initialization completed - connected: {}, BLE reset needed: {}", connected, needs_reset);
+                (connected, needs_reset)
+            }
+            Err(e) => {
+                log::warn!("WiFi start failed: {:?} - continuing without WiFi", e);
+                (false, false)
+            }
+        }
+    } else {
+        (false, false)
     };
     
     // Create and start the controller
@@ -49,26 +64,8 @@ async fn main(spawner: Spawner) {
     info!("Controller created successfully, starting...");
     
     // Start the controller with Embassy executor
-    if let Err(e) = controller.start(spawner).await {
+    // Pass WiFi status and BLE reset flag
+    if let Err(e) = controller.start(spawner, wifi_connected, ble_needs_reset).await {
         log::error!("Controller start failed: {:?}", e);
     }
-}
-
-fn initialize_wifi(
-    modem: esp_idf_svc::hal::modem::Modem,
-    nvs: EspDefaultNvsPartition,
-    sys_loop: EspSystemEventLoop,
-) -> Result<BlockingWifi<EspWifi<'static>>, Box<dyn std::error::Error>> {
-    // Create Wi-Fi driver (this initializes the networking stack)
-    let wifi = EspWifi::new(modem, sys_loop.clone(), Some(nvs))?;
-    let mut wifi = BlockingWifi::wrap(wifi, sys_loop)?;
-    
-    // Set to station mode (client mode - not creating an access point)
-    wifi.set_configuration(&Configuration::Client(Default::default()))?;
-    
-    // Start Wi-Fi (this doesn't connect to any network, just initializes the stack)
-    wifi.start()?;
-    
-    info!("Wi-Fi networking stack initialized (not connected to any network)");
-    Ok(wifi)
 }

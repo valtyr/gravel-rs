@@ -36,6 +36,7 @@ uuid = { version = "1.0", features = ["v4"], default-features = false }
 chrono = { version = "0.4", default-features = false }
 anyhow = "1.0"
 bstr = "1.0"
+qrcode = { version = "0.14", default-features = false }
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }

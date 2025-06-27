@@ -89,7 +89,7 @@ impl EspressoController {
         let relay_controller = RelayController::new(gpio19)?;
         
         // Initialize NVS storage (optional - will use defaults if it fails)
-        let nvs_storage = match NvsStorage::new() {
+        let nvs_storage = match NvsStorage::new().await {
             Ok(storage) => {
                 info!("✅ NVS storage initialized successfully");
                 Some(Arc::new(storage))
@@ -145,11 +145,21 @@ impl EspressoController {
         })
     }
 
-    pub async fn start(&mut self, spawner: Spawner) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start(&mut self, spawner: Spawner, wifi_connected: bool, ble_needs_reset: bool) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting Espresso Controller with Embassy tasks");
 
-        // Initialize BLE stack
-        BookooScale::initialize()?;
+        // Handle BLE initialization based on WiFi provisioning status
+        if ble_needs_reset {
+            info!("🔄 BLE stack cleaned up by WiFi provisioning - reinitializing for scale");
+            // WiFi provisioning already cleaned up BLE stack, just reinitialize
+            BookooScale::initialize().map_err(|e| format!("BLE init after provisioning failed: {:?}", e))?;
+        } else if !wifi_connected {
+            info!("🔵 No WiFi provisioning conflict - initializing scale BLE");
+            BookooScale::initialize().map_err(|e| format!("BLE init failed: {:?}", e))?;
+        } else {
+            info!("🔵 WiFi connected without provisioning - initializing scale BLE");
+            BookooScale::initialize().map_err(|e| format!("BLE init failed: {:?}", e))?;
+        }
 
         // Clone references for the tasks  
         let websocket_server = self.websocket_server.clone();
@@ -448,14 +458,14 @@ impl EspressoController {
         debug!("Received WebSocket command: {:?}", command);
 
         match command {
-            WebSocketCommand::SetTargetWeight(weight) => {
+            WebSocketCommand::SetTargetWeight { weight } => {
                 let mut config = self.state_manager.get_config().await;
                 config.target_weight_g = weight;
                 self.state_manager.update_config(config).await;
                 info!("Target weight set to {:.1}g", weight);
             }
 
-            WebSocketCommand::SetAutoTare(enabled) => {
+            WebSocketCommand::SetAutoTare { enabled } => {
                 let mut config = self.state_manager.get_config().await;
                 config.auto_tare = enabled;
                 self.state_manager.update_config(config).await;
@@ -465,7 +475,7 @@ impl EspressoController {
                 );
             }
 
-            WebSocketCommand::SetPredictiveStop(enabled) => {
+            WebSocketCommand::SetPredictiveStop { enabled } => {
                 let mut config = self.state_manager.get_config().await;
                 config.predictive_stop = enabled;
                 self.state_manager.update_config(config).await;

@@ -1,14 +1,19 @@
 //! NVS (Non-Volatile Storage) persistence for brew settings and learning data.
-//! Note: Currently using in-memory storage only due to NVS partition conflicts with WiFi.
+//! Uses dedicated custom partition for app settings separate from WiFi.
 
 use log::{info, warn, error, debug};
 use serde::{Deserialize, Serialize};
 use embassy_time::Instant;
 use std::sync::Arc;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
+use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsCustom};
+use esp_idf_svc::sys::EspError;
 
 // Version for settings migration
 const SETTINGS_VERSION: u8 = 1;
+
+// NVS namespace for our application
+const NVS_NAMESPACE: &str = "gravel_brew";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrewSettings {
@@ -74,28 +79,81 @@ impl Default for BrewStatistics {
 }
 
 pub struct NvsStorage {
-    // For now, we're using in-memory storage only
+    nvs: Option<Arc<Mutex<CriticalSectionRawMutex, EspNvs<NvsCustom>>>>,
     cached_settings: Arc<Mutex<CriticalSectionRawMutex, BrewSettings>>,
     cached_stats: Arc<Mutex<CriticalSectionRawMutex, BrewStatistics>>,
     mock_mode: bool,
 }
 
 impl NvsStorage {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         info!("🗄️ Initializing NVS storage for brew settings");
         
-        // For now, use mock storage to avoid NVS partition conflicts
-        warn!("⚠️ Using in-memory storage only - settings will not persist across reboots");
-        warn!("⚠️ This is temporary until NVS partition sharing is implemented");
+        // Try to initialize real NVS with custom partition
+        let (nvs, mock_mode) = match Self::init_nvs() {
+            Ok(nvs) => {
+                info!("✅ Real NVS storage initialized successfully");
+                (Some(Arc::new(Mutex::new(nvs))), false)
+            }
+            Err(e) => {
+                warn!("⚠️ NVS initialization failed: {:?} - using in-memory storage", e);
+                (None, true)
+            }
+        };
         
-        let storage = Self {
+        let mut storage = Self {
+            nvs,
             cached_settings: Arc::new(Mutex::new(BrewSettings::default())),
             cached_stats: Arc::new(Mutex::new(BrewStatistics::default())),
-            mock_mode: true,
+            mock_mode,
         };
 
-        info!("✅ Mock NVS storage initialized successfully");
+        // Load existing data if NVS is available
+        if !mock_mode {
+            if let Err(e) = storage.load_from_nvs().await {
+                warn!("Failed to load from NVS: {:?} - using defaults", e);
+            }
+        }
+
+        info!("✅ NVS storage initialized (mock_mode: {})", mock_mode);
         Ok(storage)
+    }
+    
+    fn init_nvs() -> Result<EspNvs<NvsCustom>, EspError> {
+        // Try to use a custom NVS partition (separate from WiFi)
+        // If custom partition doesn't exist, fall back to default
+        let partition = EspNvsPartition::<NvsCustom>::take("nvs_custom")
+            .or_else(|_| {
+                info!("Custom NVS partition not found, using default NVS");
+                EspNvsPartition::<NvsCustom>::take("nvs")
+            })?;
+        let nvs = EspNvs::new(partition, NVS_NAMESPACE, true)?;
+        Ok(nvs)
+    }
+    
+    async fn load_from_nvs(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref nvs_arc) = self.nvs {
+            let nvs = nvs_arc.lock().await;
+            
+            // Load settings
+            let mut buffer = vec![0u8; 1024]; // Buffer for reading
+            if let Ok(Some(data)) = nvs.get_blob("settings", &mut buffer) {
+                if let Ok(settings) = serde_json::from_slice::<BrewSettings>(data) {
+                    *self.cached_settings.lock().await = settings;
+                    info!("📂 Loaded brew settings from NVS");
+                }
+            }
+            
+            // Load statistics  
+            let mut buffer = vec![0u8; 1024]; // Buffer for reading
+            if let Ok(Some(data)) = nvs.get_blob("statistics", &mut buffer) {
+                if let Ok(stats) = serde_json::from_slice::<BrewStatistics>(data) {
+                    *self.cached_stats.lock().await = stats;
+                    info!("📊 Loaded brew statistics from NVS");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Get current settings (from cache)
@@ -108,7 +166,7 @@ impl NvsStorage {
         self.cached_stats.lock().await.clone()
     }
 
-    /// Update settings in memory (and log what would be persisted)
+    /// Update settings in cache and persist to NVS
     pub async fn update_settings(&self, settings: BrewSettings) -> Result<(), Box<dyn std::error::Error>> {
         // Update cache
         {
@@ -116,8 +174,14 @@ impl NvsStorage {
             *cached = settings.clone();
         }
 
-        // Log what would be persisted
-        if self.mock_mode {
+        // Persist to NVS if available
+        if let Some(ref nvs_arc) = self.nvs {
+            let mut nvs = nvs_arc.lock().await;
+            let data = serde_json::to_vec(&settings)?;
+            nvs.set_blob("settings", &data)?;
+            debug!("💾 Saved settings to NVS: target={:.1}g, delay={}ms, ewma={:.2}g", 
+                   settings.target_weight_g, settings.overshoot_delay_ms, settings.overshoot_ewma);
+        } else {
             debug!("📝 [MOCK] Would save settings to NVS: target={:.1}g, delay={}ms, ewma={:.2}g", 
                    settings.target_weight_g, settings.overshoot_delay_ms, settings.overshoot_ewma);
         }
@@ -144,7 +208,7 @@ impl NvsStorage {
         self.update_settings(settings).await
     }
 
-    /// Update brewing statistics
+    /// Update brewing statistics in cache and persist to NVS
     pub async fn update_statistics(&self, stats: BrewStatistics) -> Result<(), Box<dyn std::error::Error>> {
         // Update cache
         {
@@ -152,8 +216,14 @@ impl NvsStorage {
             *cached = stats.clone();
         }
 
-        // Log what would be persisted
-        if self.mock_mode {
+        // Persist to NVS if available
+        if let Some(ref nvs_arc) = self.nvs {
+            let mut nvs = nvs_arc.lock().await;
+            let data = serde_json::to_vec(&stats)?;
+            nvs.set_blob("statistics", &data)?;
+            debug!("💾 Saved statistics to NVS: {} brews, {}/{} predictions successful", 
+                   stats.total_brews, stats.successful_predictions, stats.total_predictions);
+        } else {
             debug!("📊 [MOCK] Would save statistics to NVS: {} brews, {}/{} predictions successful", 
                    stats.total_brews, stats.successful_predictions, stats.total_predictions);
         }

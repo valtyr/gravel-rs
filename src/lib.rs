@@ -12,6 +12,8 @@ pub mod overshoot;
 pub mod controller;
 pub mod safety;
 pub mod nvs_storage;
+pub mod wifi_provisioning;
+pub mod wifi_manager;
 
 pub use types::*;
 pub use controller::*;

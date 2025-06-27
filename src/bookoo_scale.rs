@@ -93,6 +93,42 @@ impl BookooScale {
     pub fn initialize() -> Result<(), ScaleError> {
         BleClient::initialize().map_err(ScaleError::from)
     }
+    
+    /// Reset the BLE stack (for use after WiFi provisioning)
+    pub fn reset_ble_stack() -> Result<(), ScaleError> {
+        info!("🔄 Resetting BLE stack after WiFi provisioning");
+        
+        // WiFi provisioning already cleaned up BLE - we just need to reinitialize
+        unsafe {
+            use esp_idf_svc::sys::*;
+            
+            // Wait for any pending operations to complete
+            embassy_time::block_for(embassy_time::Duration::from_millis(1000));
+            
+            // Check if NimBLE is already stopped by provisioning
+            // If so, we just need to reinitialize
+            let ret = nimble_port_init();
+            if ret != ESP_OK {
+                warn!("NimBLE init failed: {}, trying full reset", ret);
+                
+                // Try a gentle reset - deinit first
+                nimble_port_deinit();
+                embassy_time::block_for(embassy_time::Duration::from_millis(500));
+                
+                // Then reinitialize
+                let ret = nimble_port_init();
+                if ret != ESP_OK {
+                    return Err(ScaleError::BleError(BleError::InitializationFailed(format!("NimBLE reinit failed: {}", ret))));
+                }
+            }
+            
+            // Start NimBLE host task
+            nimble_port_freertos_init(None);
+        }
+        
+        info!("✅ BLE stack reset complete");
+        Ok(())
+    }
 
     /// Start the scale client - scan, connect, and monitor
     pub async fn start(&mut self) -> Result<(), ScaleError> {
@@ -341,6 +377,12 @@ impl BookooScale {
             if self.connection.is_none() {
                 return Err(ScaleError::NotConnected);
             }
+            
+            // Check BLE connection status from the client
+            if !self.ble_client.is_connected() {
+                warn!("BLE connection lost - returning to reconnect");
+                return Err(ScaleError::NotConnected);
+            }
         }
     }
 
@@ -482,6 +524,12 @@ impl BookooScale {
 
             // Check if still connected
             if self.connection.is_none() {
+                return Err(ScaleError::NotConnected);
+            }
+            
+            // Check BLE connection status from the client
+            if !self.ble_client.is_connected() {
+                warn!("BLE connection lost - returning to reconnect");
                 return Err(ScaleError::NotConnected);
             }
         }
