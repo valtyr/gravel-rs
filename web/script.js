@@ -72,6 +72,12 @@ class EspressoWebClient {
     }
 
     handleServerMessage(data) {
+        // Handle welcome message
+        if (data.type === 'welcome') {
+            addLogMessage(`✅ ${data.message}`);
+            return;
+        }
+        
         // Update scale data if present
         if (data.scale_data) {
             this.state.scale_weight = data.scale_data.weight_g;
@@ -97,12 +103,23 @@ class EspressoWebClient {
     }
 
     sendCommand(command) {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify(command));
-            addLogMessage(`📤 Sent: ${command.type}`);
-        } else {
-            addLogMessage('❌ WebSocket not connected - command failed');
-        }
+        fetch('/command', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(command)
+        })
+        .then(response => {
+            if (response.ok) {
+                addLogMessage(`📤 Sent: ${command.type}`);
+            } else {
+                addLogMessage(`❌ Command failed: ${command.type}`);
+            }
+        })
+        .catch(error => {
+            addLogMessage(`❌ Command error: ${error.message}`);
+        });
     }
 
     updateUI() {
@@ -120,7 +137,12 @@ class EspressoWebClient {
         // Update checkboxes to match server state
         document.getElementById('auto-tare-checkbox').checked = this.state.auto_tare_enabled;
         document.getElementById('predictive-stop-checkbox').checked = this.state.predictive_stop_enabled;
-        document.getElementById('target-weight-input').value = this.state.target_weight;
+        
+        // Only update target weight input if it's not currently focused (user isn't typing)
+        const targetInput = document.getElementById('target-weight-input');
+        if (document.activeElement !== targetInput) {
+            targetInput.value = this.state.target_weight;
+        }
 
         // Add visual indicators for connection status
         this.updateStatusColors();
@@ -161,6 +183,13 @@ function addLogMessage(message) {
     const div = document.createElement('div');
     div.textContent = `[${timestamp}] ${message}`;
     logContainer.appendChild(div);
+    
+    // Keep only the last 150 messages to prevent memory buildup
+    const maxMessages = 150;
+    while (logContainer.children.length > maxMessages) {
+        logContainer.removeChild(logContainer.firstChild);
+    }
+    
     logContainer.scrollTop = logContainer.scrollHeight;
 }
 
@@ -234,4 +263,11 @@ document.addEventListener('DOMContentLoaded', function() {
     client = new EspressoWebClient();
     addLogMessage('🚀 Espresso Scale Controller - Real-time WebSocket interface');
     addLogMessage('📡 Connecting to ESP32...');
+});
+
+// Clean up WebSocket on page unload
+window.addEventListener('beforeunload', function() {
+    if (client && client.ws) {
+        client.ws.close();
+    }
 });

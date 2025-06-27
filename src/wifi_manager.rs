@@ -7,7 +7,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::sys::EspError;
 use log::{info, warn, error, debug};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, Instant};
 
 pub struct WifiManager {
     wifi: Option<BlockingWifi<EspWifi<'static>>>,
@@ -100,62 +100,118 @@ impl WifiManager {
                     info!("🎉 WiFi provisioning completed!");
                     provisioning.stop_provisioning();
                     
-                    // Give time for BLE stack cleanup
-                    Timer::after(Duration::from_millis(2000)).await;
+                    // Brief delay for BLE stack cleanup
+                    Timer::after(Duration::from_millis(500)).await;
                     
-                    // Try to connect after provisioning
+                    // Try to connect after provisioning with fast polling
                     if let Some(ref mut wifi) = self.wifi {
-                        match wifi.wait_netif_up() {
-                            Ok(_) => {
-                                info!("✅ WiFi connected successfully after provisioning");
+                        // Poll for connection with shorter timeout
+                        for i in 0..15 { // 7.5 seconds max
+                            if wifi.is_connected().unwrap_or(false) {
+                                info!("✅ WiFi connected successfully after provisioning in {}ms", i * 500);
                                 return Ok((true, true)); // Connected, BLE needs reset
                             }
-                            Err(e) => {
-                                warn!("⚠️ Failed to connect after provisioning: {:?}", e);
-                                // Reset provisioning and try again (like dice)
-                                info!("🔄 Resetting provisioning to try again");
-                                provisioning.reset_provisioning().ok();
-                                continue;
-                            }
+                            Timer::after(Duration::from_millis(500)).await;
                         }
+                        warn!("⚠️ Failed to connect after provisioning within 7.5 seconds");
+                        // Reset provisioning and try again
+                        info!("🔄 Resetting provisioning to try again");
+                        provisioning.reset_provisioning().ok();
+                        continue;
                     }
                 } else {
                     info!("📶 Already provisioned - attempting connection");
                     
                     if let Some(ref mut wifi) = self.wifi {
-                        // DON'T set configuration for stored credentials - let ESP-IDF use stored ones
-                        // Only set default config for fresh provisioning
+                        // For stored credentials, DON'T set configuration - let ESP-IDF use stored ones
+                        // The issue was that ClientConfiguration::default() overwrites stored credentials
                         wifi.start()?;
                         
-                        // Small delay to let WiFi stack settle
-                        Timer::after(Duration::from_millis(1000)).await;
+                        // Try multiple connection attempts before giving up
+                        let mut connection_attempts = 0;
+                        const MAX_ATTEMPTS: u32 = 3;
                         
-                        match wifi.connect() {
-                            Ok(_) => {
-                                match wifi.wait_netif_up() {
-                                    Ok(_) => {
-                                        info!("✅ Connected to stored WiFi successfully");
-                                        return Ok((true, false)); // Connected, no BLE reset needed
+                        loop {
+                            connection_attempts += 1;
+                            info!("🔌 WiFi connection attempt {}/{}", connection_attempts, MAX_ATTEMPTS);
+                            let connection_start = Instant::now();
+                            
+                            match wifi.connect() {
+                                Ok(_) => {
+                                    info!("📡 WiFi connect() succeeded, checking for IP...");
+                                    // Use faster polling approach instead of wait_netif_up (which has long timeouts)
+                                    for _i in 0..12 { // Poll for 6 seconds max (12 * 500ms)
+                                        if wifi.is_connected().unwrap_or(false) {
+                                            let total_time = connection_start.elapsed().as_millis();
+                                            info!("✅ Connected to stored WiFi successfully in {}ms (attempt {})", total_time, connection_attempts);
+                                            return Ok((true, false)); // Connected, no BLE reset needed
+                                        }
+                                        Timer::after(Duration::from_millis(500)).await;
                                     }
-                                    Err(e) => {
-                                        warn!("❌ Failed to get IP with stored credentials: {:?}", e);
-                                        // Reset provisioning and try again (like dice)
+                                    let total_time = connection_start.elapsed().as_millis();
+                                    warn!("❌ WiFi connected but failed to get IP in {}ms (attempt {})", total_time, connection_attempts);
+                                    
+                                    // If this was the last attempt, reset provisioning
+                                    if connection_attempts >= MAX_ATTEMPTS {
+                                        warn!("🔄 All connection attempts failed - resetting provisioning");
                                         provisioning.reset_provisioning().ok();
-                                        continue;
+                                        break; // Exit retry loop, will restart provisioning
+                                    }
+                                    
+                                    // Stop and restart WiFi for clean retry
+                                    warn!("🔄 Stopping WiFi and waiting 2 seconds before IP retry...");
+                                    if let Err(e) = wifi.stop() {
+                                        warn!("Failed to stop WiFi: {:?}", e);
+                                    }
+                                    Timer::after(Duration::from_secs(2)).await;
+                                    
+                                    // Restart WiFi for next attempt (don't reconfigure - keep stored credentials)
+                                    wifi.start()?;
+                                    continue; // Try again
+                                }
+                                Err(e) => {
+                                    let total_time = connection_start.elapsed().as_millis();
+                                    warn!("❌ Failed to connect with stored credentials after {}ms: {:?} (attempt {})", total_time, e, connection_attempts);
+                                    
+                                    // Check error type - only reset on certain errors
+                                    let should_reset = match e.code() {
+                                        esp_idf_svc::sys::ESP_ERR_WIFI_PASSWORD => {
+                                            warn!("🔐 Bad password error - credentials are invalid");
+                                            true
+                                        }
+                                        esp_idf_svc::sys::ESP_ERR_WIFI_SSID => {
+                                            warn!("📡 SSID not found - network may be unavailable");
+                                            connection_attempts >= MAX_ATTEMPTS // Only reset after all attempts
+                                        }
+                                        esp_idf_svc::sys::ESP_ERR_TIMEOUT => {
+                                            warn!("⏱️ Connection timeout - will retry");
+                                            connection_attempts >= MAX_ATTEMPTS // Only reset after all attempts
+                                        }
+                                        _ => {
+                                            warn!("❓ Unknown WiFi error - will retry");
+                                            connection_attempts >= MAX_ATTEMPTS // Only reset after all attempts
+                                        }
+                                    };
+                                    
+                                    if should_reset {
+                                        warn!("🔄 Resetting provisioning due to connection failure");
+                                        provisioning.reset_provisioning().ok();
+                                        break; // Exit retry loop, will restart provisioning
+                                    }
+                                    
+                                    if connection_attempts < MAX_ATTEMPTS {
+                                        warn!("🔄 Stopping WiFi and waiting 3 seconds before retry...");
+                                        // Stop and restart WiFi to ensure clean state
+                                        if let Err(e) = wifi.stop() {
+                                            warn!("Failed to stop WiFi: {:?}", e);
+                                        }
+                                        Timer::after(Duration::from_secs(3)).await;
+                                        
+                                        // Restart WiFi for next attempt (don't reconfigure - keep stored credentials)
+                                        wifi.start()?;
+                                        continue; // Try again
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("❌ Failed to connect with stored credentials: {:?}", e);
-                                // Only reset on certain errors - not timeouts
-                                if matches!(e.code(), esp_idf_svc::sys::ESP_ERR_WIFI_SSID | esp_idf_svc::sys::ESP_ERR_WIFI_PASSWORD) {
-                                    warn!("🔄 Bad credentials detected - resetting provisioning");
-                                    provisioning.reset_provisioning().ok();
-                                } else {
-                                    warn!("🔄 Network issue, retrying without reset");
-                                    Timer::after(Duration::from_millis(5000)).await;
-                                }
-                                continue;
                             }
                         }
                     }
