@@ -38,7 +38,7 @@ async fn main(spawner: Spawner) {
     };
     
     // Create and start the controller
-    let mut controller = match EspressoController::new(peripherals.pins.gpio19) {
+    let mut controller = match EspressoController::new(peripherals.pins.gpio19).await {
         Ok(controller) => controller,
         Err(e) => {
             log::error!("Failed to create controller: {:?}", e);

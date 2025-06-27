@@ -11,6 +11,7 @@ pub mod brew_states;
 pub mod overshoot;
 pub mod controller;
 pub mod safety;
+pub mod nvs_storage;
 
 pub use types::*;
 pub use controller::*;

@@ -3,6 +3,7 @@ use crate::{
     ble::StatusChannel,
     bookoo_scale::{BookooScale, ScaleDataChannel},
     brew_states::{BrewStateMachine, BrewStateTransition},
+    nvs_storage::NvsStorage,
     overshoot::{OvershootController, StopTiming},
     relay::{RelayController, RelayError},
     safety::SafetyController,
@@ -39,6 +40,7 @@ pub struct EspressoController {
     auto_tare_controller: AutoTareController,
     brew_state_machine: BrewStateMachine,
     overshoot_controller: OvershootController,
+    nvs_storage: Option<Arc<NvsStorage>>,
 
     scale_data_channel: Arc<ScaleDataChannel>,
     ble_status_channel: Arc<StatusChannel>,
@@ -64,7 +66,7 @@ pub struct EspressoController {
 }
 
 impl EspressoController {
-    pub fn new(gpio19: Gpio19) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(gpio19: Gpio19) -> Result<Self, Box<dyn std::error::Error>> {
         let scale_data_channel = Arc::new(Channel::new());
         let ble_status_channel = Arc::new(Channel::new());
         let websocket_command_channel = Arc::new(Channel::new());
@@ -85,6 +87,28 @@ impl EspressoController {
         );
 
         let relay_controller = RelayController::new(gpio19)?;
+        
+        // Initialize NVS storage (optional - will use defaults if it fails)
+        let nvs_storage = match NvsStorage::new() {
+            Ok(storage) => {
+                info!("✅ NVS storage initialized successfully");
+                Some(Arc::new(storage))
+            }
+            Err(e) => {
+                warn!("⚠️  NVS storage failed to initialize: {:?} - continuing with defaults", e);
+                None
+            }
+        };
+        
+        // Initialize overshoot controller with optional NVS
+        let overshoot_controller = if let Some(ref nvs) = nvs_storage {
+            OvershootController::new_with_nvs(Arc::clone(nvs)).await
+        } else {
+            info!("Using overshoot controller without NVS persistence");
+            OvershootController::new()
+        };
+        
+        info!("🎯 Loaded learning data: {}", overshoot_controller.get_learning_info());
 
         Ok(Self {
             state_manager,
@@ -94,7 +118,8 @@ impl EspressoController {
             safety_controller: SafetyController::new(),
             auto_tare_controller: AutoTareController::new(),
             brew_state_machine: BrewStateMachine::new(),
-            overshoot_controller: OvershootController::new(),
+            overshoot_controller,
+            nvs_storage,
 
             scale_data_channel,
             ble_status_channel,
@@ -269,7 +294,7 @@ impl EspressoController {
             scale_data.weight_g, 
             target_weight, 
             scale_data.flow_rate_g_per_s
-        );
+        ).await;
     }
     
     /// Handle automatic stopping logic (from Python)
@@ -505,7 +530,7 @@ impl EspressoController {
             }
 
             WebSocketCommand::ResetOvershoot => {
-                self.overshoot_controller.reset();
+                self.overshoot_controller.reset().await;
                 self.state_manager
                     .add_log("Overshoot controller reset".to_string())
                     .await;
