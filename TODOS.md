@@ -114,6 +114,35 @@
 2. **Discovery Case**: Logs all actual UUIDs the scale exposes, allowing us to update constants if needed
 3. **Cleanup Case**: Proper disconnection when errors occur, scale shows disconnected status
 
+## WebSocket Implementation - FAILED ATTEMPTS
+
+### ❌ **Problem: ESP-IDF HTTP Server Session Blocking**
+**Root Issue**: ESP-IDF HTTP server sessions are permanently consumed by WebSocket handlers, blocking all other HTTP requests.
+
+### **Failed Attempts (5+ iterations)**:
+1. **Embassy async integration** - `embassy_futures::block_on` caused watchdog timeouts
+2. **Centralized Embassy broadcasting** - Can't integrate Embassy channels with ESP-IDF threads
+3. **Micro-sleep approach** - `std::thread::sleep(10ms)` still blocked sessions permanently 
+4. **Session limit increases** - Delayed but didn't solve the fundamental issue
+5. **Non-blocking loops** - All variants still consumed HTTP sessions forever
+
+### ❌ **Confirmed Non-Solutions**:
+- Any loop in `ws_handler` callback blocks the session permanently
+- Embassy async doesn't integrate with ESP-IDF synchronous HTTP context
+- Short sleeps don't yield HTTP sessions back to the pool
+- Session limit increases just delay the inevitable session exhaustion
+
+### ✅ **Alternative Approaches to Research**:
+1. **Server-Sent Events (SSE)** - HTTP-native push, no session blocking
+2. **Separate WebSocket Server** - Independent TCP server for WS, HTTP separate
+3. **Client Polling** - Poll `/state` at 5Hz instead of server push
+4. **Alternative HTTP Stack** - Replace ESP-IDF server entirely
+
+### 🎯 **Next Steps**:
+- Research ESP32 SSE implementations
+- Look for ESP-IDF WebSocket success stories  
+- Consider if 5Hz polling is acceptable UX trade-off
+
 ## Implementation Achievements
 
 - ✅ **Stability**: No more BLE crashes or initialization failures

@@ -55,5 +55,6 @@ qrcode = { version = "0.14", default-features = false }
 # esp-idf-svc = { version = "0.51", features = ["embassy-time-driver", "embassy-sync"] }
 # critical-section = { version = "1.1", features = ["std"], default-features = false }
 
+
 [build-dependencies]
 embuild = "0.33"

@@ -144,9 +144,39 @@ This is a multi-threaded async application with several concurrent tasks:
 - BLE and Wi-Fi coexistence requires proper configuration in `sdkconfig.defaults`
 - Embassy time driver integration requires careful task scheduling
 
+## WebSocket Implementation - CRITICAL LEARNINGS
+
+### ❌ **THE BLOCKING PROBLEM - FAILED ATTEMPTS**
+We attempted 5+ iterations to solve ESP-IDF HTTP server WebSocket blocking:
+
+1. **Embassy async integration**: `embassy_futures::block_on` caused watchdog timeouts
+2. **Centralized broadcasting**: Embassy channels couldn't integrate with ESP-IDF threads  
+3. **Micro-sleep approach**: `std::thread::sleep(10ms)` still blocked other HTTP requests
+4. **Session limit increases**: Didn't solve the fundamental architecture issue
+5. **Non-blocking loops**: Every approach still consumed HTTP sessions permanently
+
+### 🔍 **ROOT CAUSE ANALYSIS**
+- **ESP-IDF HTTP Server Architecture**: Uses fixed thread pool with session-per-connection model
+- **WebSocket Handler Scope**: Any loop in `ws_handler` callback blocks that HTTP session forever
+- **Session Exhaustion**: Once WebSocket connections consume all sessions, HTTP requests hang
+- **Thread Model Mismatch**: Embassy async doesn't integrate cleanly with ESP-IDF synchronous HTTP threads
+
+### ❌ **CONFIRMED NON-SOLUTIONS**
+- Embassy `block_on` in ESP-IDF context (causes watchdog timeout)
+- Short sleeps in WebSocket loops (still block HTTP sessions)
+- Increasing session limits (delays but doesn't fix the problem)
+- Channel-based broadcasting (can't integrate with ESP-IDF session lifecycle)
+
+### ✅ **VIABLE ALTERNATIVES TO RESEARCH**
+1. **Alternative HTTP Server**: Replace ESP-IDF server entirely (picoserve had compatibility issues)
+2. **WebSocket-only Server**: Separate TCP server for WebSocket, keep HTTP separate
+3. **Server-Sent Events (SSE)**: HTTP-native real-time alternative to WebSocket
+4. **Polling-based Updates**: Client polls `/state` endpoint at 5Hz instead of push
+
 ## Development Guidance
 
 - If you get stuck instead of reducing scope or stubbing things out, ask me for input
+- **WebSocket + ESP-IDF**: Fundamentally problematic architecture - research alternatives first
 
 ## Best Practices
 

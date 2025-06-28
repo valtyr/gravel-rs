@@ -1,11 +1,10 @@
-// Espresso Scale Controller WebSocket Client
-// Real-time connection to ESP32 WebSocket server
+// Espresso Scale Controller HTTP Polling Client
+// Real-time connection to ESP32 via 5Hz HTTP polling
 
 class EspressoWebClient {
     constructor() {
-        this.ws = null;
-        this.reconnectDelay = 1000;
-        this.maxReconnectDelay = 30000;
+        this.pollingInterval = null;
+        this.pollingRate = 200; // 5Hz (200ms)
         this.state = {
             scale_weight: 0.0,
             target_weight: 36.0,
@@ -21,62 +20,55 @@ class EspressoWebClient {
             overshoot_info: 'No data',
             error: null
         };
-        this.initWebSocket();
+        this.initPolling();
     }
 
-    initWebSocket() {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
+    initPolling() {
+        addLogMessage('🔄 Starting HTTP polling at 5Hz (200ms intervals)');
         
-        addLogMessage(`Connecting to WebSocket: ${wsUrl}`);
+        // Start immediate poll
+        this.pollServer();
         
+        // Set up polling interval
+        this.pollingInterval = setInterval(() => {
+            this.pollServer();
+        }, this.pollingRate);
+        
+        addLogMessage('✅ HTTP polling started - real-time data active');
+    }
+
+    async pollServer() {
         try {
-            this.ws = new WebSocket(wsUrl);
-            
-            this.ws.onopen = () => {
-                addLogMessage('✅ WebSocket connected - real-time data active');
-                this.reconnectDelay = 1000; // Reset delay on successful connection
-            };
-            
-            this.ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    this.handleServerMessage(data);
-                } catch (e) {
-                    addLogMessage(`❌ Error parsing server message: ${e.message}`);
+            const response = await fetch('/state', {
+                method: 'GET',
+                headers: {
+                    'Cache-Control': 'no-cache'
                 }
-            };
+            });
             
-            this.ws.onclose = () => {
-                addLogMessage('❌ WebSocket connection lost - attempting reconnection...');
-                this.scheduleReconnect();
-            };
-            
-            this.ws.onerror = (error) => {
-                addLogMessage(`❌ WebSocket error: ${error.message || 'Connection failed'}`);
-            };
-            
-        } catch (e) {
-            addLogMessage(`❌ Failed to create WebSocket: ${e.message}`);
-            this.scheduleReconnect();
+            if (response.ok) {
+                const data = await response.json();
+                this.handleServerMessage(data);
+            } else {
+                console.warn(`Polling failed: ${response.status} ${response.statusText}`);
+                // Don't spam logs for temporary failures
+            }
+        } catch (error) {
+            console.warn(`Polling error: ${error.message}`);
+            // Don't spam logs for network errors
         }
     }
 
-    scheduleReconnect() {
-        setTimeout(() => {
-            this.initWebSocket();
-        }, this.reconnectDelay);
-        
-        // Exponential backoff up to max delay
-        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+    stopPolling() {
+        if (this.pollingInterval) {
+            clearInterval(this.pollingInterval);
+            this.pollingInterval = null;
+            addLogMessage('⏹️ HTTP polling stopped');
+        }
     }
 
     handleServerMessage(data) {
-        // Handle welcome message
-        if (data.type === 'welcome') {
-            addLogMessage(`✅ ${data.message}`);
-            return;
-        }
+        // Skip welcome message handling (not needed for polling)
         
         // Update scale data if present
         if (data.scale_data) {
@@ -258,16 +250,16 @@ document.getElementById('predictive-stop-checkbox').addEventListener('change', f
     });
 });
 
-// Initialize WebSocket client on page load
+// Initialize HTTP polling client on page load
 document.addEventListener('DOMContentLoaded', function() {
     client = new EspressoWebClient();
-    addLogMessage('🚀 Espresso Scale Controller - Real-time WebSocket interface');
-    addLogMessage('📡 Connecting to ESP32...');
+    addLogMessage('🚀 Espresso Scale Controller - Real-time HTTP polling interface');
+    addLogMessage('📡 Connecting to ESP32 via 5Hz polling...');
 });
 
-// Clean up WebSocket on page unload
+// Clean up polling on page unload
 window.addEventListener('beforeunload', function() {
-    if (client && client.ws) {
-        client.ws.close();
+    if (client) {
+        client.stopPolling();
     }
 });

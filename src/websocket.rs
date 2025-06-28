@@ -4,21 +4,16 @@ use embassy_time::{Duration, Timer};
 use esp_idf_svc::http::server::{EspHttpServer, Configuration};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
-use esp_idf_svc::ws::FrameType;
 use log::{info, debug, warn, error};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use std::sync::Arc;
-use std::thread;
-use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
 use anyhow;
 
 pub type WebSocketCommandChannel = Channel<CriticalSectionRawMutex, WebSocketCommand, 10>;
 
-// WebSocket connection manager to track active connections  
-static WS_CONNECTIONS: std::sync::LazyLock<StdMutex<HashMap<i32, bool>>> = 
-    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+// Note: WebSocket connection tracking removed - using simple HTTP polling now
+
 
 
 
@@ -95,6 +90,9 @@ impl WebSocketServer {
     
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting HTTP server with WebSocket support");
+        
+        // Using individual connection broadcasting for ESP-IDF compatibility
+        info!("WebSocket server starting with individual connection management");
         
         // Configure HTTP server with much higher session limits for WebSocket
         let config = Configuration {
@@ -210,30 +208,11 @@ impl WebSocketServer {
         })?;
 
 
-        // WebSocket endpoint - proper ESP-IDF pattern with connection tracking
+        // State endpoint for client polling (replaces WebSocket)
         let state_handle = Arc::clone(&self.state);
-        
-        server.ws_handler("/ws", move |connection| {
-            info!("WebSocket handler called");
+        server.fn_handler("/state", Method::Get, move |request| -> Result<(), anyhow::Error> {
+            debug!("Serving /state endpoint for polling client");
             
-            // Get the socket file descriptor for this connection
-            let socket_fd = connection.session();
-            
-            // Register this connection
-            if let Ok(mut connections) = WS_CONNECTIONS.lock() {
-                connections.insert(socket_fd, true);
-                info!("Registered WebSocket connection fd: {}", socket_fd);
-            }
-            
-            // Send welcome message as JSON
-            let welcome_msg = r#"{"type":"welcome","message":"Connected to Espresso Scale Controller"}"#;
-            if let Err(e) = connection.send(FrameType::Text(false), welcome_msg.as_bytes()) {
-                warn!("Failed to send welcome message: {:?}", e);
-            } else {
-                info!("Sent welcome message to new WebSocket connection");
-            }
-            
-            // Send initial state
             if let Ok(state) = state_handle.try_lock() {
                 let response = WebSocketResponse {
                     scale_data: state.scale_data.as_ref().map(|data| ScaleDataMsg {
@@ -261,93 +240,28 @@ impl WebSocketServer {
                 };
                 
                 if let Ok(json) = serde_json::to_string(&response) {
-                    if let Err(e) = connection.send(FrameType::Text(false), json.as_bytes()) {
-                        warn!("Failed to send initial state: {:?}", e);
-                    } else {
-                        info!("Sent initial state to WebSocket connection");
-                    }
+                    let mut http_response = request.into_response(200, Some("OK"), &[
+                        ("Content-Type", "application/json"),
+                        ("Cache-Control", "no-cache"),
+                        ("Access-Control-Allow-Origin", "*")
+                    ])?;
+                    http_response.write_all(json.as_bytes())?;
+                    debug!("Successfully served state JSON ({} bytes)", json.len());
+                } else {
+                    warn!("Failed to serialize state to JSON");
+                    let mut http_response = request.into_response(500, Some("Internal Server Error"), &[])?;
+                    http_response.write_all(b"Failed to serialize state")?;
                 }
+            } else {
+                warn!("State locked, returning error");
+                let mut http_response = request.into_response(503, Some("Service Unavailable"), &[])?;
+                http_response.write_all(b"State temporarily unavailable")?;
             }
             
-            // Keep connection alive and send periodic updates - this is the proper ESP-IDF pattern
-            info!("Starting efficient WebSocket connection loop for fd {}", socket_fd);
-            
-            let mut last_state_update = std::time::Instant::now();
-            let mut last_heartbeat = std::time::Instant::now();
-            let mut update_counter = 0u32;
-            
-            loop {
-                // Check if connection is still alive
-                if connection.is_closed() {
-                    info!("WebSocket connection {} is closing after {} updates", socket_fd, update_counter);
-                    if let Ok(mut connections) = WS_CONNECTIONS.lock() {
-                        connections.remove(&socket_fd);
-                        info!("Removed WebSocket connection fd: {}", socket_fd);
-                    }
-                    break;
-                }
-                
-                let now = std::time::Instant::now();
-                
-                // Send state update every 200ms (5Hz) but only if state changed or forced
-                let should_send_update = now.duration_since(last_state_update) >= std::time::Duration::from_millis(200);
-                
-                if should_send_update {
-                    if let Ok(state) = state_handle.try_lock() {
-                        let response = WebSocketResponse {
-                            scale_data: state.scale_data.as_ref().map(|data| ScaleDataMsg {
-                                weight_g: data.weight_g,
-                                flow_rate_g_per_s: data.flow_rate_g_per_s,
-                                battery_percent: data.battery_percent,
-                                timer_running: data.timer_running,
-                                timestamp_ms: data.timestamp_ms,
-                            }),
-                            system_state: SystemStateMsg {
-                                brew_state: format!("{:?}", state.brew_state),
-                                timer_state: format!("{:?}", state.timer_state),
-                                target_weight_g: state.config.target_weight_g,
-                                auto_tare_enabled: state.config.auto_tare,
-                                predictive_stop_enabled: state.config.predictive_stop,
-                                relay_enabled: state.relay_enabled,
-                                ble_connected: state.ble_connected,
-                                error: state.last_error.clone(),
-                                overshoot_info: "Learning data not available".to_string(),
-                            },
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                        };
-                        
-                        if let Ok(json) = serde_json::to_string(&response) {
-                            if let Err(e) = connection.send(FrameType::Text(false), json.as_bytes()) {
-                                warn!("Failed to send state update to WebSocket fd {} after {} updates: {:?}", socket_fd, update_counter, e);
-                                break; // Connection failed, exit loop
-                            }
-                            update_counter += 1;
-                            last_state_update = now;
-                        }
-                    } else {
-                        // Send heartbeat if state is locked and it's been a while
-                        if now.duration_since(last_heartbeat) > std::time::Duration::from_secs(10) {
-                            if let Err(e) = connection.send(FrameType::Text(false), b"heartbeat") {
-                                warn!("Failed to send heartbeat to WebSocket fd {}: {:?}", socket_fd, e);
-                                break;
-                            }
-                            last_heartbeat = now;
-                        }
-                    }
-                }
-                
-                // Sleep for a shorter interval to check connection status more frequently
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
-            info!("WebSocket handler exiting for connection {}", socket_fd);
-            anyhow::Ok(())
+            Ok(())
         })?;
         
-        info!("HTTP server with WebSocket started successfully");
+        info!("HTTP server started successfully (polling mode)");
         info!("Server configuration:");
         info!("  Max sessions: {}", config.max_sessions);
         info!("  Session timeout: {:?}", config.session_timeout);
@@ -356,8 +270,8 @@ impl WebSocketServer {
         info!("  GET  / - Web interface");
         info!("  GET  /style.css - Stylesheet");  
         info!("  GET  /script.js - JavaScript");
+        info!("  GET  /state - Real-time state (for 5Hz polling)");
         info!("  POST /command - Command endpoint");
-        info!("  WS   /ws - WebSocket real-time data (5Hz)");
         
         // Keep server alive
         loop {
@@ -371,6 +285,7 @@ impl WebSocketServer {
         self.start().await
     }
 }
+
 
 // Helper function for processing WebSocket commands (simplified for build)
 pub async fn process_websocket_command(
