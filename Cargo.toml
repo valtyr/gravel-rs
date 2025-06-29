@@ -37,6 +37,10 @@ chrono = { version = "0.4", default-features = false }
 anyhow = "1.0"
 bstr = "1.0"
 qrcode = { version = "0.14", default-features = false }
+statig = "0.3"
+embedded-graphics = "0.8"
+sh1106 = "0.5"
+embedded-hal = "0.2"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }

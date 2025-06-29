@@ -173,11 +173,99 @@ We attempted 5+ iterations to solve ESP-IDF HTTP server WebSocket blocking:
 3. **Server-Sent Events (SSE)**: HTTP-native real-time alternative to WebSocket
 4. **Polling-based Updates**: Client polls `/state` endpoint at 5Hz instead of push
 
+## Phase 3: World-Class Architecture (Current)
+
+### **Core Philosophy: Event-Driven State Machine**
+- **Single Source of Truth**: One comprehensive state machine handles WiFi, BLE, and brewing
+- **Pure Side Effects**: State machine makes decisions, outputs drive hardware
+- **Scale Independence**: Strategy pattern handles different scale button detection methods
+- **Clean Event Bus**: No rx/tx sprawl, type-safe subscriptions, async iterator style
+
+### **Critical Architecture Principles**
+
+#### **State Machine Design**
+- **System-wide scope**: Not just brewing - includes BLE connection, WiFi provisioning, scale detection
+- **Superstates**: ScaleConnected, ActiveBrewing, SystemInit for logical grouping
+- **State-local data**: Each state carries relevant data (timestamps, weights, connections)
+- **Multiple paths**: Auto-tare optional, manual vs predictive stop, graceful disconnection handling
+- **Reactive to scale**: User can press scale buttons OR use web interface - both work seamlessly
+
+#### **Scale Event Detection Strategy Pattern**
+```rust
+// Different scales have different button detection methods
+trait ScaleEventDetector {
+    fn analyze_data(&mut self, data: ScaleData) -> Vec<SystemEvent>;
+}
+
+// Bookoo: Inference-based (watch weight/timer for button presses)
+BookooEventDetector // Detects tare = weight drop, timer = timestamp changes
+
+// Future Acaia: Message-based (hypothetical explicit button events)  
+AcaiaEventDetector // Parses event codes from scale
+
+// Reusable components across strategies
+TimerStateTracker, WeightChangeTracker
+```
+
+#### **Event Bus Architecture**
+```rust
+// Clean interface - no channel complexity exposed
+let event_bus = EventBus::new();
+
+// Publishing - one line
+event_bus.publish(SystemEvent::ScaleConnected(ScaleType::Bookoo)).await;
+
+// Subscribing - type-safe and filtered
+let mut scale_events = event_bus.subscribe_to_scale_events();
+let brew_event = scale_events.next().await; // Async iterator style
+```
+
+#### **Pure Side Effects Model**
+```rust
+// State machine decides what should happen
+SystemEvent::UserTareRequested -> handle_event() -> [TareRequested output]
+
+// Output handlers do the actual work  
+TareRequested -> scale.send_command(Tare)
+RelayOn -> relay.turn_on()
+DisplayUpdate -> display.refresh()
+
+// NO direct hardware calls in business logic
+```
+
+### **Implementation Status**
+
+#### **🚨 Current Critical Issue**
+**Relay not triggering** - State machine integration was commented out during Phase 2 refactor. Need to:
+1. Implement `handle_brew_output()` method in controller 
+2. Process `RelayOn`/`RelayOff` outputs from BrewController
+3. Test full brewing flow works again
+
+#### **📋 Implementation Priority**
+1. **Fix relay** (Phase 3A) - Critical for basic functionality
+2. **Event bus foundation** (Phase 3B) - Clean communication layer
+3. **Scale event detection** (Phase 3C) - Handle scale button presses  
+4. **Comprehensive state machine** (Phase 3D) - Full system state coverage
+5. **Advanced features** (Phase 3E) - Tick events, generic BLE scanner
+6. **Testing framework** (Phase 3F) - Multi-crate workspace for unit tests
+
+### **Architecture Benefits**
+- **Traceable**: Every action flows through events - easy debugging
+- **Testable**: Pure state machine logic, mockable outputs
+- **Extensible**: Easy to add scales, states, events
+- **Robust**: Handles scale disconnections, button presses, web commands
+- **User-friendly**: Scale buttons work seamlessly with web interface
+
 ## Development Guidance
 
 - If you get stuck instead of reducing scope or stubbing things out, ask me for input
 - **WebSocket + ESP-IDF**: Fundamentally problematic architecture - research alternatives first
+- **Event-driven first**: Always consider how new features fit into event bus + state machine
+- **Scale buttons matter**: Remember users have physical scale buttons - design reactively
 
 ## Best Practices
 
 - Keep track of todos in a TODOS.md that you keep updated and refer to. This makes sure you aren't limited by context size
+- **State machine is the brain**: All decisions flow through state machine, hardware is just outputs
+- **Events are the nervous system**: Clean event bus connects everything
+- **Strategies handle variety**: Different scales need different approaches

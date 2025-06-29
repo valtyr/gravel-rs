@@ -4,22 +4,19 @@
 use crate::ble::{
     BleClient, BleError, Characteristic, Connection, Device, DeviceFilter, StatusChannel, Uuid,
 };
-use crate::protocol::parse_scale_data;
+use crate::scales::protocol::parse_scale_data;
+use crate::scales::traits::{
+    BleScale, ScaleCapabilities, ScaleCommand, ScaleCommandChannel, ScaleDataChannel, ScaleInfo,
+    SmartScale,
+};
 use crate::types::ScaleData;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Timer};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
 
-// Import scale command types
-use crate::controller::{ScaleCommand, ScaleCommandChannel};
-
-// Channel types for scale communication
-pub type ScaleDataChannel = Channel<CriticalSectionRawMutex, ScaleData, 10>;
-
 // Bookoo scale UUIDs - scale uses 16-bit UUIDs, not 128-bit
 const BOOKOO_SERVICE_UUID_16: u16 = 0x0FFE; // Service UUID as 16-bit (discovered from hardware)
-const WEIGHT_CHAR_UUID_16: u16 = 0xFF11; // Weight characteristic UUID as 16-bit  
+const WEIGHT_CHAR_UUID_16: u16 = 0xFF11; // Weight characteristic UUID as 16-bit
 const COMMAND_CHAR_UUID_16: u16 = 0xFF12; // Command characteristic UUID as 16-bit
 
 // Fallback 128-bit UUIDs (in case some scales use full UUIDs)
@@ -74,11 +71,25 @@ pub struct BookooScale {
     connection: Option<Connection>,
     weight_characteristic: Option<Characteristic>,
     command_characteristic: Option<Characteristic>,
+    info: ScaleInfo,
 }
 
 impl BookooScale {
     pub fn new(data_channel: Arc<ScaleDataChannel>, status_channel: Arc<StatusChannel>) -> Self {
         let ble_client = BleClient::new(status_channel);
+
+        let info = ScaleInfo {
+            brand: "Bookoo".to_string(),
+            model: "Themis Mini".to_string(),
+            version: None,
+            capabilities: ScaleCapabilities {
+                has_timer: true,
+                has_flow_rate: true,
+                has_battery_level: true,
+                supports_tare: true,
+                supports_auto_off: false,
+            },
+        };
 
         Self {
             ble_client,
@@ -86,6 +97,7 @@ impl BookooScale {
             connection: None,
             weight_characteristic: None,
             command_characteristic: None,
+            info,
         }
     }
 
@@ -93,39 +105,41 @@ impl BookooScale {
     pub fn initialize() -> Result<(), ScaleError> {
         BleClient::initialize().map_err(ScaleError::from)
     }
-    
+
     /// Reset the BLE stack (for use after WiFi provisioning)
     pub fn reset_ble_stack() -> Result<(), ScaleError> {
         info!("🔄 Resetting BLE stack after WiFi provisioning");
-        
+
         // WiFi provisioning already cleaned up BLE - we just need to reinitialize
         unsafe {
             use esp_idf_svc::sys::*;
-            
+
             // Wait for any pending operations to complete
             embassy_time::block_for(embassy_time::Duration::from_millis(1000));
-            
+
             // Check if NimBLE is already stopped by provisioning
             // If so, we just need to reinitialize
             let ret = nimble_port_init();
             if ret != ESP_OK {
                 warn!("NimBLE init failed: {}, trying full reset", ret);
-                
+
                 // Try a gentle reset - deinit first
                 nimble_port_deinit();
                 embassy_time::block_for(embassy_time::Duration::from_millis(500));
-                
+
                 // Then reinitialize
                 let ret = nimble_port_init();
                 if ret != ESP_OK {
-                    return Err(ScaleError::BleError(BleError::InitializationFailed(format!("NimBLE reinit failed: {}", ret))));
+                    return Err(ScaleError::BleError(BleError::InitializationFailed(
+                        format!("NimBLE reinit failed: {}", ret),
+                    )));
                 }
             }
-            
+
             // Start NimBLE host task
             nimble_port_freertos_init(None);
         }
-        
+
         info!("✅ BLE stack reset complete");
         Ok(())
     }
@@ -151,11 +165,17 @@ impl BookooScale {
     }
 
     /// Start the scale client with command channel support
-    pub async fn start_with_commands(&mut self, command_channel: Arc<ScaleCommandChannel>) -> Result<(), ScaleError> {
+    pub async fn start_with_commands(
+        &mut self,
+        command_channel: Arc<ScaleCommandChannel>,
+    ) -> Result<(), ScaleError> {
         info!("Starting Bookoo scale client with command channel");
 
         loop {
-            match self.connect_and_monitor_with_commands(command_channel.clone()).await {
+            match self
+                .connect_and_monitor_with_commands(command_channel.clone())
+                .await
+            {
                 Ok(_) => {
                     info!("Scale connection cycle completed");
                 }
@@ -202,7 +222,10 @@ impl BookooScale {
     }
 
     /// Connect to scale and monitor for data with command processing
-    async fn connect_and_monitor_with_commands(&mut self, command_channel: Arc<ScaleCommandChannel>) -> Result<(), ScaleError> {
+    async fn connect_and_monitor_with_commands(
+        &mut self,
+        command_channel: Arc<ScaleCommandChannel>,
+    ) -> Result<(), ScaleError> {
         // Step 1: Scan for Bookoo scale
         let scale_device = self.find_scale().await?;
         info!("Found Bookoo scale: {:?}", scale_device.name);
@@ -227,7 +250,8 @@ impl BookooScale {
         }
 
         // Step 5: Monitor for data and commands
-        self.monitor_scale_data_with_commands(command_channel).await?;
+        self.monitor_scale_data_with_commands(command_channel)
+            .await?;
 
         Ok(())
     }
@@ -245,7 +269,7 @@ impl BookooScale {
         if let Some(device) = self
             .ble_client
             .scan_for_first_device(Some(filter), 10000)
-            .await? 
+            .await?
         {
             if let Some(ref name) = device.name {
                 if name.starts_with("BOOKOO_SC") {
@@ -258,6 +282,75 @@ impl BookooScale {
         Err(ScaleError::ScaleNotFound)
     }
 
+    /// Connect directly to a specific device without scanning
+    /// This method is used by the generic scanner to connect to a pre-discovered device
+    pub async fn connect_to_device(&mut self, device: Device) -> Result<(), ScaleError> {
+        info!("🔗 Connecting directly to Bookoo device: {:?}", device.name);
+
+        // Step 1: Connect to the provided device (skip scanning)
+        let connection = self.ble_client.connect(&device).await?;
+        self.connection = Some(connection.clone());
+        info!("✅ Connected to Bookoo device");
+
+        // Step 2: Discover services and characteristics
+        self.discover_scale_services(&connection).await?;
+        info!("🔍 Discovered Bookoo scale services and characteristics");
+
+        // Step 3: Subscribe to weight notifications
+        if let Some(ref weight_char) = self.weight_characteristic {
+            self.ble_client
+                .subscribe_to_notifications(&connection, weight_char)
+                .await?;
+            info!("📊 Subscribed to Bookoo weight notifications");
+        } else {
+            return Err(ScaleError::CharacteristicNotFound);
+        }
+
+        info!("🎉 Bookoo scale connection setup complete!");
+        Ok(())
+    }
+
+    /// Start monitoring connected device for scale data with command support
+    /// This method is used after connect_to_device() to begin data processing
+    pub async fn start_monitoring_with_commands(
+        &self,
+        command_channel: Arc<ScaleCommandChannel>,
+    ) -> Result<(), ScaleError> {
+        if !self.is_connected() {
+            return Err(ScaleError::NotConnected);
+        }
+        
+        info!("🏃 Starting Bookoo scale monitoring with commands...");
+        self.monitor_scale_data_with_commands(command_channel).await
+    }
+
+    /// Start monitoring connected device for scale data (no commands)
+    pub async fn start_monitoring(&self) -> Result<(), ScaleError> {
+        if !self.is_connected() {
+            return Err(ScaleError::NotConnected);
+        }
+        
+        info!("🏃 Starting Bookoo scale monitoring...");
+        self.monitor_scale_data().await
+    }
+
+    /// Disconnect from the scale and clean up resources
+    pub async fn disconnect(&mut self) -> Result<(), ScaleError> {
+        if let Some(connection) = &self.connection {
+            if let Err(e) = self.ble_client.disconnect(connection).await {
+                warn!("Failed to disconnect cleanly: {}", e);
+                // Continue with cleanup even if disconnect fails
+            }
+        }
+
+        self.connection = None;
+        self.weight_characteristic = None;
+        self.command_characteristic = None;
+
+        info!("📱 Bookoo scale disconnected and cleaned up");
+        Ok(())
+    }
+
     /// Discover Bookoo scale services and characteristics
     async fn discover_scale_services(&mut self, connection: &Connection) -> Result<(), ScaleError> {
         info!("Discovering Bookoo scale services...");
@@ -268,10 +361,12 @@ impl BookooScale {
         // Find the Bookoo scale service (try 16-bit first, then 128-bit fallback)
         let bookoo_service_uuid_16 = Uuid::from_u16(BOOKOO_SERVICE_UUID_16);
         let bookoo_service_uuid_128 = Uuid::from_u128_bytes(BOOKOO_SERVICE_UUID_128);
-        
+
         let scale_service = services
             .iter()
-            .find(|service| service.uuid == bookoo_service_uuid_16 || service.uuid == bookoo_service_uuid_128)
+            .find(|service| {
+                service.uuid == bookoo_service_uuid_16 || service.uuid == bookoo_service_uuid_128
+            })
             .ok_or(ScaleError::ServiceNotFound)?;
 
         info!("Found Bookoo scale service: {:?}", scale_service);
@@ -295,7 +390,9 @@ impl BookooScale {
                     characteristic.uuid, characteristic.handle
                 );
                 self.weight_characteristic = Some(characteristic);
-            } else if characteristic.uuid == command_uuid_16 || characteristic.uuid == command_uuid_128 {
+            } else if characteristic.uuid == command_uuid_16
+                || characteristic.uuid == command_uuid_128
+            {
                 info!(
                     "Found command characteristic: {:?} at handle {}",
                     characteristic.uuid, characteristic.handle
@@ -377,7 +474,7 @@ impl BookooScale {
             if self.connection.is_none() {
                 return Err(ScaleError::NotConnected);
             }
-            
+
             // Check BLE connection status from the client
             if !self.ble_client.is_connected() {
                 warn!("BLE connection lost - returning to reconnect");
@@ -437,25 +534,35 @@ impl BookooScale {
         }
 
         let connection = self.connection.as_ref().unwrap();
-        
+
         if let Some(ref command_char) = self.command_characteristic {
             info!("Sending {} command: {:02X?}", command_name, command);
-            
-            if let Err(e) = self.ble_client.write_characteristic(connection, command_char, command).await {
+
+            if let Err(e) = self
+                .ble_client
+                .write_characteristic(connection, command_char, command)
+                .await
+            {
                 error!("Failed to send {} command: {:?}", command_name, e);
                 return Err(ScaleError::from(e));
             }
-            
+
             info!("{} command sent successfully", command_name);
             Ok(())
         } else {
-            warn!("Command characteristic not available - cannot send {} command", command_name);
+            warn!(
+                "Command characteristic not available - cannot send {} command",
+                command_name
+            );
             Err(ScaleError::CharacteristicNotFound)
         }
     }
 
     /// Monitor scale for incoming data and process commands
-    async fn monitor_scale_data_with_commands(&self, command_channel: Arc<ScaleCommandChannel>) -> Result<(), ScaleError> {
+    async fn monitor_scale_data_with_commands(
+        &self,
+        command_channel: Arc<ScaleCommandChannel>,
+    ) -> Result<(), ScaleError> {
         info!("Monitoring scale for weight data and commands...");
 
         let mut no_data_count = 0;
@@ -465,8 +572,10 @@ impl BookooScale {
             // Check for commands with a timeout so we don't block data processing
             match embassy_futures::select::select(
                 command_channel.receive(),
-                Timer::after(Duration::from_millis(100))
-            ).await {
+                Timer::after(Duration::from_millis(100)),
+            )
+            .await
+            {
                 embassy_futures::select::Either::First(command) => {
                     self.handle_command(command).await;
                 }
@@ -526,7 +635,7 @@ impl BookooScale {
             if self.connection.is_none() {
                 return Err(ScaleError::NotConnected);
             }
-            
+
             // Check BLE connection status from the client
             if !self.ble_client.is_connected() {
                 warn!("BLE connection lost - returning to reconnect");
@@ -563,5 +672,59 @@ impl BookooScale {
                 }
             }
         }
+    }
+}
+
+// Implement SmartScale trait
+impl SmartScale for BookooScale {
+    fn get_info(&self) -> &ScaleInfo {
+        &self.info
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connection.is_some()
+    }
+}
+
+// Implement BleScale trait
+impl BleScale for BookooScale {
+    fn get_ble_name_pattern(&self) -> &str {
+        "BOOKOO_SC"
+    }
+
+    fn get_service_uuid(&self) -> uuid::Uuid {
+        // Convert from 16-bit to full UUID
+        uuid::Uuid::from_u128(0x0000_0FFE_0000_1000_8000_00805F9B34FB)
+    }
+
+    fn get_data_characteristic_uuid(&self) -> uuid::Uuid {
+        // Convert from 16-bit to full UUID
+        uuid::Uuid::from_u128(0x0000_FF11_0000_1000_8000_00805F9B34FB)
+    }
+
+    fn get_command_characteristic_uuid(&self) -> Option<uuid::Uuid> {
+        // Convert from 16-bit to full UUID
+        Some(uuid::Uuid::from_u128(
+            0x0000_FF12_0000_1000_8000_00805F9B34FB,
+        ))
+    }
+
+    fn parse_data(&self, raw_data: &[u8]) -> Result<ScaleData, Box<dyn std::error::Error>> {
+        parse_scale_data(raw_data).ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to parse scale data",
+            )) as Box<dyn std::error::Error>
+        })
+    }
+
+    fn format_command(&self, command: ScaleCommand) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let cmd_bytes = match command {
+            ScaleCommand::Tare => [0x10, 0x00, 0x00, 0x00, 0x00, 0x10],
+            ScaleCommand::StartTimer => [0x03, 0x00, 0x00, 0x00, 0x00, 0x03],
+            ScaleCommand::StopTimer => [0x04, 0x00, 0x00, 0x00, 0x00, 0x04],
+            ScaleCommand::ResetTimer => [0x05, 0x00, 0x00, 0x00, 0x00, 0x05],
+        };
+        Ok(cmd_bytes.to_vec())
     }
 }

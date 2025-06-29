@@ -1,19 +1,16 @@
+// Core modules
 pub mod ble;
-pub mod ble_bindings;
-pub mod bookoo_scale;
-pub mod websocket;
-pub mod relay;
-pub mod state;
-pub mod protocol;
-pub mod types;
-pub mod auto_tare;
-pub mod brew_states;
-pub mod overshoot;
-pub mod controller;
-pub mod safety;
-pub mod nvs_storage;
-pub mod wifi_provisioning;
-pub mod wifi_manager;
+pub mod brewing;
+pub mod hardware;
+pub mod scales;
+pub mod server;
+pub mod system;
+pub mod wifi;
 
-pub use types::*;
+// Legacy modules (to be refactored)
+pub mod controller;
+pub mod state;
+pub mod types;
+
 pub use controller::*;
+pub use types::*;

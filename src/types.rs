@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use embassy_time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimerState {
@@ -86,7 +86,6 @@ pub struct WebSocketMessage {
     pub message_type: String,
     pub data: serde_json::Value,
 }
-
 
 pub const TARE_STABILITY_THRESHOLD_G: f32 = 0.5; // Match Python implementation for faster cup removal detection
 pub const TARE_STABILITY_COUNT: usize = 5;

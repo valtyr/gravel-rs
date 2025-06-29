@@ -143,7 +143,99 @@
 - Look for ESP-IDF WebSocket success stories  
 - Consider if 5Hz polling is acceptable UX trade-off
 
-## Implementation Achievements
+## Phase 3: World-Class Architecture Redesign (Latest)
+
+### 🎯 **Current Critical Issues Identified**
+1. **Relay not triggering** - State machine integration was commented out during refactor
+2. **Logic scattered** - Auto-tare, overshoot, timer detection happening outside state machine
+3. **Missing centralized event flow** - No single source of truth for system state
+
+### 🚀 **World-Class Architecture Plan**
+
+#### **Comprehensive State Machine**
+- **System-wide state machine** (not just brewing) - WiFi, BLE, brewing all flow through one state machine
+- **Superstates for logical grouping** - ScaleConnected, ActiveBrewing, SystemInit
+- **State-local data** - Each state can carry its own data (timestamps, weights, etc.)
+- **Multiple valid paths** - Auto-tare optional, manual vs predictive stop, etc.
+- **Scale disconnection handling** - Always returns to appropriate idle state
+
+#### **Scale Event Detection Strategy Pattern**
+- **Bookoo Strategy**: Inference-based (watch weight/timer changes for button presses)
+- **Acaia Strategy**: Message-based (hypothetical explicit button events)
+- **Pearl Strategy**: Hybrid approach (messages + inference fallback)
+- **Reusable components**: TimerStateTracker, WeightChangeTracker
+- **Strategy registry**: Easy to add new scales, some can share strategies
+
+#### **Clean Event Bus Architecture**
+- **Zero rx/tx sprawl** - Clean publish/subscribe interface
+- **Type-safe filtered subscriptions** - subscribe_to_scale_events(), subscribe_to_brew_events()
+- **Async iterator style** - `let event = events.next().await`
+- **No boilerplate** - One line to publish, one line to subscribe
+- **Testing-friendly** - Clean mocking interface (for future multi-crate workspace)
+
+#### **Pure Side Effects Model**
+- **State machine decides** - Pure decision-making logic
+- **Outputs drive actions** - RelayOn/Off, SendScaleCommand, TareRequested
+- **No direct hardware calls** - Everything flows through event bus
+- **Web interface commands** → Events → State machine → Outputs → Hardware
+
+#### **Generic BLE + Scale Detection**
+- **Generic BLE scanner** - Finds any BLE device
+- **Scale matchers** - Each scale exposes `matches_device(device) -> bool`
+- **Connection handoff** - Scanner finds device, hands off to appropriate scale implementation
+- **Simplified codebase** - Less duplication, cleaner architecture
+
+### 📋 **Implementation Priority**
+
+#### **Phase 3A: Fix Critical Issues (IN PROGRESS)**
+55. **Fix relay not triggering** - Integrate BrewController with main controller ⚠️ **HIGH PRIORITY**
+56. **Implement handle_brew_output method** - Process RelayOn/Off outputs from state machine
+57. **Test relay control through state machine** - Ensure brewing flow works again
+
+#### **Phase 3B: Event Bus Foundation**
+58. **Create clean EventBus interface** - Hide rx/tx complexity, type-safe subscriptions
+59. **Implement SystemEvent enum** - Scale, Brew, User, Time, Safety events
+60. **Add EventStream with filtering** - subscribe_to_scale_events(), etc.
+61. **Update modules to use event bus** - Replace direct calls with event publishing
+
+#### **Phase 3C: Scale Event Detection**
+62. **Implement ScaleEventDetector trait** - Strategy pattern for button detection
+63. **Create BookooEventDetector** - Inference-based detection (weight/timer changes)
+64. **Add ScaleEventDetectorRegistry** - Map scale types to strategies
+65. **Integrate scale event detection** - Convert scale data to user action events
+
+#### **Phase 3D: Comprehensive State Machine**
+66. **Expand state machine to system-wide** - BLE, WiFi, brewing all in one state machine
+67. **Implement superstates** - ScaleConnected, ActiveBrewing, SystemInit
+68. **Add state-local data** - Timestamps, weights, connection info per state
+69. **Move auto-tare logic to state machine** - Pure state transitions + outputs
+70. **Move overshoot control to state machine** - Tick events for time-based logic
+
+#### **Phase 3E: Advanced Features**
+71. **Implement tick events** - Periodic time events for timeouts, delays
+72. **Add generic BLE scanner** - Scale detection and handoff
+73. **Integrate WiFi provisioning states** - Complete system state coverage
+74. **Convert all scale commands to side effects** - No direct hardware calls
+
+#### **Phase 3F: Testing & Quality (Future)**
+75. **Create multi-crate workspace** - Platform-independent code in separate crate
+76. **Add comprehensive unit tests** - Test state machine logic, event detection
+77. **Performance optimization** - Event bus efficiency, state machine speed
+78. **Documentation** - Architecture diagrams, state transition docs
+
+### ✅ **Architecture Benefits**
+- **Single source of truth** - One state machine knows everything
+- **Traceable flow** - Every action traced through events  
+- **Testable** - State machine pure, outputs testable
+- **Predictable** - No hidden side effects
+- **Debuggable** - State transitions logged
+- **Extensible** - Easy to add scales, states, events
+- **User-friendly** - Scale buttons work seamlessly with web interface
+
+### 🎯 **Next Critical Step**
+Get relay working again by implementing handle_brew_output method and ensuring BrewController outputs (RelayOn/RelayOff) properly control the hardware relay.
+
+## Legacy Implementation Achievements
 
 - ✅ **Stability**: No more BLE crashes or initialization failures
 - ✅ **Reliability**: Consistent connection and discovery
