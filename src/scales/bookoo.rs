@@ -205,10 +205,9 @@ impl BookooScale {
         self.discover_scale_services(&connection).await?;
         info!("Discovered scale services and characteristics");
 
-        // Step 4: Subscribe to weight notifications
+        // Step 4: Subscribe to weight notifications with retry logic
         if let Some(ref weight_char) = self.weight_characteristic {
-            self.ble_client
-                .subscribe_to_notifications(&connection, weight_char)
+            self.subscribe_to_notifications_resilient(&connection, weight_char)
                 .await?;
             info!("Subscribed to weight notifications");
         } else {
@@ -239,10 +238,9 @@ impl BookooScale {
         self.discover_scale_services(&connection).await?;
         info!("Discovered scale services and characteristics");
 
-        // Step 4: Subscribe to weight notifications
+        // Step 4: Subscribe to weight notifications with retry logic
         if let Some(ref weight_char) = self.weight_characteristic {
-            self.ble_client
-                .subscribe_to_notifications(&connection, weight_char)
+            self.subscribe_to_notifications_resilient(&connection, weight_char)
                 .await?;
             info!("Subscribed to weight notifications");
         } else {
@@ -296,10 +294,9 @@ impl BookooScale {
         self.discover_scale_services(&connection).await?;
         info!("🔍 Discovered Bookoo scale services and characteristics");
 
-        // Step 3: Subscribe to weight notifications
+        // Step 3: Subscribe to weight notifications with retry logic
         if let Some(ref weight_char) = self.weight_characteristic {
-            self.ble_client
-                .subscribe_to_notifications(&connection, weight_char)
+            self.subscribe_to_notifications_resilient(&connection, weight_char)
                 .await?;
             info!("📊 Subscribed to Bookoo weight notifications");
         } else {
@@ -351,12 +348,37 @@ impl BookooScale {
         Ok(())
     }
 
-    /// Discover Bookoo scale services and characteristics
+    /// Discover Bookoo scale services and characteristics (with retries for resilience)
     async fn discover_scale_services(&mut self, connection: &Connection) -> Result<(), ScaleError> {
         info!("Discovering Bookoo scale services...");
 
-        // Discover all services
-        let services = self.ble_client.discover_services(connection).await?;
+        const MAX_DISCOVERY_RETRIES: u32 = 3;
+        const DISCOVERY_RETRY_DELAY_MS: u64 = 1000;
+
+        let mut services = None;
+        
+        // Retry service discovery - this is often flaky on BLE connections
+        for attempt in 1..=MAX_DISCOVERY_RETRIES {
+            match self.ble_client.discover_services(connection).await {
+                Ok(discovered_services) => {
+                    info!("Service discovery succeeded on attempt {}", attempt);
+                    services = Some(discovered_services);
+                    break;
+                }
+                Err(e) => {
+                    warn!("Service discovery failed on attempt {}/{}: {:?}", attempt, MAX_DISCOVERY_RETRIES, e);
+                    if attempt < MAX_DISCOVERY_RETRIES {
+                        info!("Retrying service discovery in {}ms...", DISCOVERY_RETRY_DELAY_MS);
+                        Timer::after(Duration::from_millis(DISCOVERY_RETRY_DELAY_MS)).await;
+                    } else {
+                        error!("Service discovery failed after {} attempts", MAX_DISCOVERY_RETRIES);
+                        return Err(ScaleError::BleError(e));
+                    }
+                }
+            }
+        }
+
+        let services = services.ok_or(ScaleError::ServiceNotFound)?;
 
         // Find the Bookoo scale service (try 16-bit first, then 128-bit fallback)
         let bookoo_service_uuid_16 = Uuid::from_u16(BOOKOO_SERVICE_UUID_16);
@@ -371,11 +393,34 @@ impl BookooScale {
 
         info!("Found Bookoo scale service: {:?}", scale_service);
 
-        // Discover characteristics for the scale service
-        let characteristics = self
-            .ble_client
-            .discover_characteristics(connection, scale_service)
-            .await?;
+        // Discover characteristics for the scale service (with retries)
+        let mut characteristics = None;
+        
+        for attempt in 1..=MAX_DISCOVERY_RETRIES {
+            match self
+                .ble_client
+                .discover_characteristics(connection, scale_service)
+                .await
+            {
+                Ok(discovered_chars) => {
+                    info!("Characteristic discovery succeeded on attempt {}", attempt);
+                    characteristics = Some(discovered_chars);
+                    break;
+                }
+                Err(e) => {
+                    warn!("Characteristic discovery failed on attempt {}/{}: {:?}", attempt, MAX_DISCOVERY_RETRIES, e);
+                    if attempt < MAX_DISCOVERY_RETRIES {
+                        info!("Retrying characteristic discovery in {}ms...", DISCOVERY_RETRY_DELAY_MS);
+                        Timer::after(Duration::from_millis(DISCOVERY_RETRY_DELAY_MS)).await;
+                    } else {
+                        error!("Characteristic discovery failed after {} attempts", MAX_DISCOVERY_RETRIES);
+                        return Err(ScaleError::BleError(e));
+                    }
+                }
+            }
+        }
+
+        let characteristics = characteristics.ok_or(ScaleError::CharacteristicNotFound)?;
 
         // Find weight and command characteristics (try both 16-bit and 128-bit UUIDs)
         let weight_uuid_16 = Uuid::from_u16(WEIGHT_CHAR_UUID_16);
@@ -411,6 +456,41 @@ impl BookooScale {
         }
 
         Ok(())
+    }
+
+    /// Subscribe to notifications with retry logic for resilience
+    async fn subscribe_to_notifications_resilient(
+        &self,
+        connection: &Connection,
+        characteristic: &Characteristic,
+    ) -> Result<(), ScaleError> {
+        const MAX_SUBSCRIPTION_RETRIES: u32 = 3;
+        const SUBSCRIPTION_RETRY_DELAY_MS: u64 = 500;
+
+        for attempt in 1..=MAX_SUBSCRIPTION_RETRIES {
+            match self
+                .ble_client
+                .subscribe_to_notifications(connection, characteristic)
+                .await
+            {
+                Ok(_) => {
+                    info!("Notification subscription succeeded on attempt {}", attempt);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("Notification subscription failed on attempt {}/{}: {:?}", attempt, MAX_SUBSCRIPTION_RETRIES, e);
+                    if attempt < MAX_SUBSCRIPTION_RETRIES {
+                        info!("Retrying subscription in {}ms...", SUBSCRIPTION_RETRY_DELAY_MS);
+                        Timer::after(Duration::from_millis(SUBSCRIPTION_RETRY_DELAY_MS)).await;
+                    } else {
+                        error!("Notification subscription failed after {} attempts", MAX_SUBSCRIPTION_RETRIES);
+                        return Err(ScaleError::BleError(e));
+                    }
+                }
+            }
+        }
+
+        unreachable!()
     }
 
     /// Monitor scale for incoming data

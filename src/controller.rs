@@ -212,6 +212,26 @@ impl EspressoController {
             ))
             .map_err(|_| "Failed to spawn scale data bridge task")?;
 
+        // 🚀 Initialize state machine with proper startup events
+        info!("🎯 Initializing state machine with startup events");
+        
+        // Notify state machine that system is enabled and BLE is starting
+        let startup_outputs = self.brew_controller.handle_input(BrewInput::EnableSystem);
+        for output in startup_outputs {
+            self.handle_brew_output(output).await;
+        }
+        
+        let ble_outputs = self.brew_controller.handle_input(BrewInput::BleEnabled);
+        for output in ble_outputs {
+            self.handle_brew_output(output).await;
+        }
+        
+        // Tell state machine that BLE scanning is starting
+        let scanning_outputs = self.brew_controller.handle_input(BrewInput::BleScanning);
+        for output in scanning_outputs {
+            self.handle_brew_output(output).await;
+        }
+
         // 🚀 Run the WORLD-CLASS event-driven control loop!
         self.event_driven_control_loop().await;
 
@@ -398,6 +418,9 @@ impl EspressoController {
                     data.weight_g, data.flow_rate_g_per_s
                 );
 
+                // Update safety controller with data receipt
+                self.safety_controller.update_data_received();
+
                 // 🕵️ INTELLIGENT EVENT DETECTION - Analyze raw data for patterns!
                 let detected_events = self.scale_event_detector.process_data(&data);
                 
@@ -456,6 +479,8 @@ impl EspressoController {
             }
             ScaleEvent::TimerStarted { timestamp_ms } => {
                 info!("⏱️ Scale timer started: {}ms", timestamp_ms);
+                // Update timer state for web interface
+                self.state_manager.update_timer_state(TimerState::Running).await;
                 // Trigger brewing
                 self.get_event_publisher()
                     .user_command(UserEvent::StartBrewing)
@@ -463,6 +488,8 @@ impl EspressoController {
             }
             ScaleEvent::TimerStopped { timestamp_ms } => {
                 info!("⏹️ Scale timer stopped: {}ms", timestamp_ms);
+                // Update timer state for web interface
+                self.state_manager.update_timer_state(TimerState::Idle).await;
                 self.get_event_publisher()
                     .user_command(UserEvent::StopBrewing)
                     .await;
@@ -1337,16 +1364,40 @@ async fn scale_data_bridge_task(
                     .await;
             }
             Either::Second(ble_connected) => {
-                // Convert BLE status to network event and publish
+                // Convert BLE status to both network and scale events
                 if ble_connected {
                     event_publisher
                         .publish(SystemEvent::Network(NetworkEvent::BleConnected { 
                             device_name: "Bookoo Scale".to_string() 
                         }))
                         .await;
+                        
+                    // Also publish scale connection event with scale info
+                    let scale_info = crate::scales::traits::ScaleInfo {
+                        brand: "Bookoo".to_string(),
+                        model: "Themis Mini".to_string(),
+                        version: None,
+                        capabilities: crate::scales::traits::ScaleCapabilities {
+                            has_timer: true,
+                            has_flow_rate: true,
+                            has_battery_level: true,
+                            supports_tare: true,
+                            supports_auto_off: false,
+                        },
+                    };
+                    event_publisher
+                        .publish(SystemEvent::Scale(ScaleEvent::Connected { info: scale_info }))
+                        .await;
                 } else {
                     event_publisher
                         .publish(SystemEvent::Network(NetworkEvent::BleDisconnected))
+                        .await;
+                        
+                    // Also publish scale disconnection event
+                    event_publisher
+                        .publish(SystemEvent::Scale(ScaleEvent::Disconnected { 
+                            reason: "BLE connection lost".to_string() 
+                        }))
                         .await;
                 }
             }

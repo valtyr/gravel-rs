@@ -130,23 +130,37 @@ impl ScaleEventDetector {
                 data.timestamp_ms
             };
             
-            // Timer just started (timestamp jumped from 0 or small value)
-            if !self.timer_running && data.timestamp_ms > 0 && timestamp_delta < TIMER_RESTART_THRESHOLD_MS {
-                info!("⏱️ Timer started detected: {}ms", data.timestamp_ms);
-                self.timer_running = true;
-                self.last_timer_update = Some(now);
-                events.push(ScaleEvent::TimerStarted { 
-                    timestamp_ms: data.timestamp_ms 
-                });
+            // Timer just started - detect multiple scenarios:
+            // 1. Timer was at 0 and now has a small positive value (fresh start)
+            // 2. Timer jumped from 0 or was previously stopped and now increasing
+            if !self.timer_running && data.timestamp_ms > 0 {
+                let timer_start_detected = if last_timestamp == 0 {
+                    // Fresh start from 0
+                    data.timestamp_ms < 5000 // Started within last 5 seconds
+                } else {
+                    // Timer restarted (small jump)
+                    timestamp_delta < TIMER_RESTART_THRESHOLD_MS
+                };
+                
+                if timer_start_detected {
+                    info!("⏱️ Timer started detected: {}ms (delta: {}ms)", data.timestamp_ms, timestamp_delta);
+                    self.timer_running = true;
+                    self.last_timer_update = Some(now);
+                    events.push(ScaleEvent::TimerStarted { 
+                        timestamp_ms: data.timestamp_ms 
+                    });
+                }
             }
-            // Timer stopped (timestamp not increasing or went to 0)
-            else if self.timer_running && (data.timestamp_ms == 0 || data.timestamp_ms == last_timestamp) {
+            // Timer stopped (timestamp went to 0)
+            else if self.timer_running && data.timestamp_ms == 0 {
                 info!("⏹️ Timer stopped detected: {}ms", data.timestamp_ms);
                 self.timer_running = false;
                 events.push(ScaleEvent::TimerStopped { 
                     timestamp_ms: data.timestamp_ms 
                 });
             }
+            // Timer stopped due to no timestamp updates for extended period (handled by timeout logic below)
+            // NOTE: We don't trigger stop on same timestamp anymore to avoid false positives
             // Timer reset (timestamp jumped to small value)
             else if data.timestamp_ms < 1000 && last_timestamp > 5000 {
                 info!("🔄 Timer reset detected: {}ms -> {}ms", last_timestamp, data.timestamp_ms);

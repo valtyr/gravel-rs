@@ -589,20 +589,16 @@ impl BrewStateMachine {
                     context.outputs.push(BrewOutput::TareScale);
                 }
                 
-                // Check if timer just started
-                if data.timer_running && !context.timer_running {
-                    context.timer_running = true;
-                    context.last_weight = Some(data.weight_g);
-                    context.outputs.push(BrewOutput::RelayOn);
-                    context.outputs.push(BrewOutput::BrewingStarted);
-                    return Transition(State::brewing());
-                }
+                // Timer start detection is handled by ScaleEventDetector -> UserEvent::StartBrewing
+                // This ensures proper debouncing and avoids false triggers from raw timer_running field
                 
                 Handled
             }
             BrewInput::UserCommand(UserEvent::StartBrewing) => {
                 context.outputs.push(BrewOutput::StartTimer);
-                Handled
+                context.outputs.push(BrewOutput::RelayOn);
+                context.outputs.push(BrewOutput::BrewingStarted);
+                Transition(State::brewing())
             }
             BrewInput::UserCommand(UserEvent::TareScale) => {
                 context.outputs.push(BrewOutput::TareScale);
@@ -822,14 +818,8 @@ impl BrewStateMachine {
                 context.timer_running = data.timer_running;
                 context.outputs.push(BrewOutput::DisplayUpdate);
                 
-                // Check if timer restarted (new brew)
-                if data.timer_running && !context.timer_running {
-                    context.timer_running = true;
-                    context.last_weight = Some(data.weight_g);
-                    context.outputs.push(BrewOutput::RelayOn);
-                    context.outputs.push(BrewOutput::BrewingStarted);
-                    return Transition(State::brewing());
-                }
+                // Timer restart detection is handled by ScaleEventDetector -> UserEvent::StartBrewing
+                // This ensures proper debouncing and avoids false triggers from raw timer_running field
                 
                 Handled
             }
