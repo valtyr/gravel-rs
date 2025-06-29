@@ -31,6 +31,14 @@ pub enum BrewInput {
     WifiDisconnected,
     WifiConnecting,
     
+    // WiFi provisioning events
+    WifiProvisioningRequired,
+    WifiProvisioningStarted,
+    WifiCredentialsReceived { ssid: String, password: String },
+    WifiProvisioningCompleted,
+    WifiProvisioningFailed { reason: String },
+    WifiProvisioningTimeout,
+    
     // From scale (ignored when system disabled)
     ScaleData(ScaleData),
     ScaleConnected,
@@ -66,6 +74,7 @@ pub enum BrewOutput {
     // To scale
     StartTimer,
     StopTimer,
+    ResetTimer,
     TareScale,
 
     // To relay
@@ -79,7 +88,12 @@ pub enum BrewOutput {
     StopBleScanning,
     ConnectToWifi { ssid: String, password: String },
     DisconnectWifi,
+    
+    // WiFi provisioning outputs
     StartWifiProvisioning,
+    StopWifiProvisioning,
+    WifiProvisioningStatusChanged { active: bool, device_name: Option<String> },
+    ResetWifiCredentials,
 
     // To UI/system
     StateChanged { from: SystemState, to: SystemState },
@@ -119,6 +133,10 @@ pub enum SystemState {
     WifiConnecting,     // WiFi connecting
     WifiConnected,      // WiFi connected but scale disconnected
     
+    // 📱 WiFi provisioning states
+    WifiProvisioningRequired,   // Need to provision WiFi credentials
+    WifiProvisioningActive,     // Currently provisioning via BLE
+    
     // 📱 Scale connection states (requires BLE)
     ScaleDisconnected,  // BLE connected but scale not found/connected
     
@@ -151,6 +169,10 @@ pub struct BrewContext {
     ble_scanning: bool,
     wifi_connected: bool,
     wifi_connecting: bool,
+    wifi_provisioned: bool,
+    wifi_provisioning_active: bool,
+    wifi_provisioning_device_name: Option<String>,
+    wifi_credentials: Option<(String, String)>, // (ssid, password)
     scale_connected: bool,
     
     // Auto-tare state
@@ -193,6 +215,10 @@ impl Default for BrewContext {
             ble_scanning: false,
             wifi_connected: false,
             wifi_connecting: false,
+            wifi_provisioned: false,
+            wifi_provisioning_active: false,
+            wifi_provisioning_device_name: None,
+            wifi_credentials: None,
             scale_connected: false,
             
             // Auto-tare defaults
@@ -582,6 +608,10 @@ impl BrewStateMachine {
                 context.outputs.push(BrewOutput::TareScale);
                 Handled
             }
+            BrewInput::UserCommand(UserEvent::ResetTimer) => {
+                context.outputs.push(BrewOutput::ResetTimer);
+                Handled
+            }
             BrewInput::AutoTareEnabled => {
                 context.auto_tare_enabled = true;
                 Handled
@@ -592,6 +622,25 @@ impl BrewStateMachine {
             }
             BrewInput::OvershootReset => {
                 Self::reset_overshoot_controller(context);
+                Handled
+            }
+            BrewInput::Tick => {
+                // Check auto-tare brewing cooldown expiration
+                if let Some(brewing_cooldown) = context.auto_tare_brewing_cooldown_time {
+                    if Instant::now().duration_since(brewing_cooldown) >= Duration::from_secs(10) {
+                        debug!("⏰ Auto-tare brewing cooldown expired");
+                        context.auto_tare_brewing_cooldown_time = None;
+                    }
+                }
+                
+                // Check regular auto-tare cooldown expiration
+                if let Some(last_tare) = context.auto_tare_last_tare_time {
+                    if Instant::now().duration_since(last_tare) >= Duration::from_millis(TARE_COOLDOWN_MS) {
+                        debug!("⏰ Auto-tare cooldown expired");
+                        // Don't reset the time here - it will be reset on next auto-tare
+                    }
+                }
+                
                 Handled
             }
             _ => Handled,
@@ -708,6 +757,21 @@ impl BrewStateMachine {
                 context.outputs.push(BrewOutput::TareScale);
                 Handled
             }
+            BrewInput::Tick => {
+                // Handle predictive stop timing
+                if let Some(stop_time) = context.overshoot_pending_stop_time {
+                    if Instant::now() >= stop_time {
+                        debug!("⏰ Executing delayed predictive stop");
+                        context.overshoot_pending_stop_time = None;
+                        context.overshoot_pending_predicted_stop = true;
+                        context.outputs.push(BrewOutput::RelayOff);
+                        context.outputs.push(BrewOutput::StopTimer);
+                        context.settle_start_time = Some(Instant::now());
+                        return Transition(State::settling());
+                    }
+                }
+                Handled
+            }
             _ => Handled,
         }
     }
@@ -785,6 +849,202 @@ impl BrewStateMachine {
                 context.outputs.push(BrewOutput::TareScale);
                 Handled
             }
+            BrewInput::Tick => {
+                // Check settling timeout
+                if let Some(settle_start) = context.settle_start_time {
+                    if Instant::now().duration_since(settle_start) >= context.settling_timeout {
+                        debug!("⏰ Settling timeout reached, transitioning to idle");
+                        context.settle_start_time = None;
+                        context.outputs.push(BrewOutput::BrewingFinished);
+                        // Notify auto-tare that brewing finished
+                        Self::auto_tare_brewing_finished(context, context.current_weight);
+                        return Transition(State::idle());
+                    }
+                }
+                Handled
+            }
+            _ => Handled,
+        }
+    }
+
+    /// 📶 WIFI PROVISIONING REQUIRED STATE - No WiFi credentials, need to provision
+    #[state]
+    fn wifi_provisioning_required(context: &mut BrewContext, event: &BrewInput) -> Response<State> {
+        use Response::*;
+        
+        match event {
+            BrewInput::DisableSystem => {
+                context.system_enabled = false;
+                context.outputs.push(BrewOutput::SystemDisabled);
+                Transition(State::system_disabled())
+            }
+            BrewInput::WifiProvisioningStarted => {
+                context.wifi_provisioning_active = true;
+                let device_name = format!("GravelScale-{}", Instant::now().as_millis() % 10000);
+                context.wifi_provisioning_device_name = Some(device_name.clone());
+                context.outputs.push(BrewOutput::StartWifiProvisioning);
+                context.outputs.push(BrewOutput::WifiProvisioningStatusChanged { 
+                    active: true, 
+                    device_name: Some(device_name) 
+                });
+                Transition(State::wifi_provisioning_active())
+            }
+            BrewInput::UserCommand(UserEvent::StartWifiProvisioning) => {
+                context.outputs.push(BrewOutput::StartWifiProvisioning);
+                Handled
+            }
+            BrewInput::WifiConnected => {
+                // Skip provisioning if WiFi suddenly connects
+                context.wifi_connected = true;
+                context.wifi_provisioned = true;
+                if context.ble_enabled {
+                    if context.scale_connected {
+                        Transition(State::idle())
+                    } else {
+                        Transition(State::scale_disconnected())
+                    }
+                } else {
+                    Transition(State::ble_disabled())
+                }
+            }
+            BrewInput::EmergencyStop => {
+                context.outputs.push(BrewOutput::RelayOff);
+                Handled
+            }
+            _ => Handled,
+        }
+    }
+
+    /// 📶 WIFI PROVISIONING ACTIVE STATE - Currently provisioning via BLE
+    #[state]
+    fn wifi_provisioning_active(context: &mut BrewContext, event: &BrewInput) -> Response<State> {
+        use Response::*;
+        
+        match event {
+            BrewInput::DisableSystem => {
+                context.system_enabled = false;
+                context.outputs.push(BrewOutput::SystemDisabled);
+                context.outputs.push(BrewOutput::StopWifiProvisioning);
+                Transition(State::system_disabled())
+            }
+            BrewInput::WifiCredentialsReceived { ssid, password } => {
+                info!("📶 WiFi credentials received: SSID={}", ssid);
+                context.wifi_credentials = Some((ssid.clone(), password.clone()));
+                context.outputs.push(BrewOutput::ConnectToWifi { ssid: ssid.clone(), password: password.clone() });
+                context.wifi_connecting = true;
+                Transition(State::wifi_connecting())
+            }
+            BrewInput::WifiProvisioningCompleted => {
+                context.wifi_provisioning_active = false;
+                context.wifi_provisioned = true;
+                context.outputs.push(BrewOutput::StopWifiProvisioning);
+                context.outputs.push(BrewOutput::WifiProvisioningStatusChanged { 
+                    active: false, 
+                    device_name: None 
+                });
+                if context.wifi_connected {
+                    if context.ble_enabled {
+                        if context.scale_connected {
+                            Transition(State::idle())
+                        } else {
+                            Transition(State::scale_disconnected())
+                        }
+                    } else {
+                        Transition(State::ble_disabled())
+                    }
+                } else {
+                    Transition(State::wifi_connecting())
+                }
+            }
+            BrewInput::WifiProvisioningFailed { reason } => {
+                info!("❌ WiFi provisioning failed: {}", reason);
+                context.wifi_provisioning_active = false;
+                context.outputs.push(BrewOutput::StopWifiProvisioning);
+                context.outputs.push(BrewOutput::WifiProvisioningStatusChanged { 
+                    active: false, 
+                    device_name: None 
+                });
+                Transition(State::wifi_provisioning_required())
+            }
+            BrewInput::WifiProvisioningTimeout => {
+                info!("⏰ WiFi provisioning timeout");
+                context.wifi_provisioning_active = false;
+                context.outputs.push(BrewOutput::StopWifiProvisioning);
+                context.outputs.push(BrewOutput::WifiProvisioningStatusChanged { 
+                    active: false, 
+                    device_name: None 
+                });
+                Transition(State::wifi_provisioning_required())
+            }
+            BrewInput::UserCommand(UserEvent::ResetWifiCredentials) => {
+                context.wifi_credentials = None;
+                context.wifi_provisioned = false;
+                context.outputs.push(BrewOutput::ResetWifiCredentials);
+                context.outputs.push(BrewOutput::StopWifiProvisioning);
+                Transition(State::wifi_provisioning_required())
+            }
+            BrewInput::EmergencyStop => {
+                context.outputs.push(BrewOutput::RelayOff);
+                Handled
+            }
+            _ => Handled,
+        }
+    }
+
+    /// 📶 WIFI CONNECTING STATE - Attempting to connect with received credentials
+    #[state]
+    fn wifi_connecting(context: &mut BrewContext, event: &BrewInput) -> Response<State> {
+        use Response::*;
+        
+        match event {
+            BrewInput::DisableSystem => {
+                context.system_enabled = false;
+                context.outputs.push(BrewOutput::SystemDisabled);
+                Transition(State::system_disabled())
+            }
+            BrewInput::WifiConnected => {
+                context.wifi_connected = true;
+                context.wifi_connecting = false;
+                context.wifi_provisioned = true;
+                context.outputs.push(BrewOutput::NetworkStatusChanged { 
+                    ble_enabled: context.ble_enabled, 
+                    wifi_connected: true 
+                });
+                info!("✅ WiFi connection successful");
+                
+                // Transition based on BLE/scale state
+                if context.ble_enabled {
+                    if context.scale_connected {
+                        Transition(State::idle())
+                    } else {
+                        Transition(State::scale_disconnected())
+                    }
+                } else {
+                    Transition(State::ble_disabled())
+                }
+            }
+            BrewInput::WifiDisconnected | BrewInput::WifiProvisioningFailed { .. } => {
+                context.wifi_connected = false;
+                context.wifi_connecting = false;
+                context.outputs.push(BrewOutput::NetworkStatusChanged { 
+                    ble_enabled: context.ble_enabled, 
+                    wifi_connected: false 
+                });
+                info!("❌ WiFi connection failed, returning to provisioning");
+                Transition(State::wifi_provisioning_required())
+            }
+            BrewInput::UserCommand(UserEvent::ResetWifiCredentials) => {
+                context.wifi_credentials = None;
+                context.wifi_provisioned = false;
+                context.wifi_connecting = false;
+                context.outputs.push(BrewOutput::ResetWifiCredentials);
+                context.outputs.push(BrewOutput::DisconnectWifi);
+                Transition(State::wifi_provisioning_required())
+            }
+            BrewInput::EmergencyStop => {
+                context.outputs.push(BrewOutput::RelayOff);
+                Handled
+            }
             _ => Handled,
         }
     }
@@ -806,6 +1066,9 @@ impl BrewStateMachine {
             State::BleEnabled {} => SystemState::BleEnabled,
             State::BleScanning {} => SystemState::BleScanning,
             State::BleConnecting {} => SystemState::BleConnecting,
+            State::WifiProvisioningRequired {} => SystemState::WifiProvisioningRequired,
+            State::WifiProvisioningActive {} => SystemState::WifiProvisioningActive,
+            State::WifiConnecting {} => SystemState::WifiConnecting,
             State::ScaleDisconnected {} => SystemState::ScaleDisconnected,
             State::Idle {} => SystemState::Idle,
             State::Brewing {} => SystemState::Brewing,

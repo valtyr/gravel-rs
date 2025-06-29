@@ -1,264 +1,241 @@
-# Espresso Scale Controller
+# Gravel - Intelligent Espresso Scale Controller
 
-> [!WARNING]  
-> I wanted to give vibe coding a try, so this whole thing (including the README.md) was built by talking to Claude without ever opening an editor. Any jank you find is purely the AI's fault. I'm a real programmer, I swear.
+An ESP32-C6 Rust application that provides automated, weight-based espresso shot control by integrating with a Bookoo Themis Mini scale via BLE and controlling an espresso machine through relay switching.
 
-## About
+## Overview
 
-This project retrofits a Stone Plus espresso machine with a Bookoo Themis Mini scale and an ESP32-C6 board to enable fully automated, weight-based shot control.
+Gravel transforms any espresso machine into a smart brewing system by:
+- **BLE Scale Integration**: Real-time weight and flow rate data from Bookoo scale
+- **Predictive Stopping**: Advanced flow analysis with adaptive overshoot compensation  
+- **Auto-Tare Detection**: Intelligent object placement/removal detection
+- **Web Interface**: Real-time monitoring and control via WiFi
+- **Event-Driven Architecture**: Unified state machine managing all brewing operations
 
-A custom wiring harness taps into the brew switch in parallel—so the machine works normally when the ESP isn’t powered or the scale is off. The mod is clean, 100% reversible, and driven entirely by software.
+## Quick Start
 
-It uses BLE to get live weight and flow data from the scale, and drives a relay to start/stop brewing. The whole thing runs async in Rust, with a web UI for real-time control and configuration.
+```bash
+# Flash and run
+cargo espflash flash --release --port /dev/ttyUSB0
+cargo espflash monitor --port /dev/ttyUSB0
 
-Why? Because you deserve better espresso.
-
-## Features
-
-### Core Functionality
-
-- **BLE Scale Integration**: Connects to Bookoo Themis Mini scale using custom protocol
-- **Predictive Shot Control**: Uses flow rate data to predict optimal stop timing
-- **Auto-Tare System**: Automatically tares scale when objects are placed/removed
-- **Overshoot Learning**: Adaptive compensation for brewing delays
-
-### Web Interface
-
-- **Real-time Monitoring**: Live weight, flow rate, and system status
-- **Configuration**: Adjust target weight, auto-tare, and other settings
-- **Manual Controls**: Tare scale, start/stop timer, test relay
-- **System Health**: BLE/Wi-Fi status, error messages, and logs
-
-### Advanced Features
-
-- **State Management**: Comprehensive brewing state tracking
-- **Multi-tasking**: Concurrent BLE, Wi-Fi, and control operations
-- **Robust Error Handling**: Graceful degradation and recovery
+# Access web interface at http://[ESP_IP]:8081
+```
 
 ## Hardware Requirements
 
 - **ESP32-C6** development board
-- **Bookoo Themis Mini** scale
-- **Relay module** connected to GPIO19 (active high) for espresso machine control
-- **Wi-Fi network** for web interface access
+- **Bookoo Themis Mini** smart scale  
+- **Relay module** (GPIO19, active high)
+- **WiFi network** for web interface
 
-## Wiring Diagram
+## Repository Structure
 
-Below is a schematic representation of the custom wiring harness that enables parallel control of the brew switch:
-
-<img src="images/harness.svg" alt="Wiring Harness" width="700" />
-
-The harness is inserted between the espresso machine’s brew switch and its controller using standard blade connectors:
-
-- `STONE_CTRL_*_IN`: Male blade connectors to the espresso machine's original brew switch terminals
-- `BREW_SWITCH_*_OUT`: Female blade connectors that reconnect to the brew switch
-- `RELAY_*_OUT`: Bare wires that connect to the ESP32-driven relay's NO/COM terminals
-
-This setup ensures that the machine functions normally even if the ESP is unpowered or the scale is disconnected. The modification is 100% reversible and operates entirely at low voltage (5V), so light-gauge wire is sufficient.
-
-## Usage
-
-### Initial Setup
-
-1. Power on the ESP32-C6
-2. Ensure the Bookoo scale is discoverable (power cycle if needed)
-3. Access the web interface to configure settings
-
-### Brewing Process
-
-1. Place cup on scale (auto-tare will activate)
-2. The system automatically detects timer start from scale
-3. Predictive stopping occurs based on flow rate analysis
-4. System returns to idle state after brewing
-
-### Manual Controls
-
-- **Tare Scale**: Zero the scale reading
-- **Start/Stop Timer**: Manual timer control
-- **Test Relay**: Test GPIO relay functionality
-- **Reset Overshoot**: Clear adaptive learning data
-- **Configuration**: Adjust target weight and auto-tare settings
-
-## Development Setup Instructions
-
-### 1. Environment Setup
-
-```bash
-# Install Rust and ESP-IDF toolchain
-cargo install espup
-espup install
-. $HOME/export-esp.sh
-
-# Install additional tools
-cargo install cargo-espflash
-```
-
-### 2. Configuration
-
-Edit `sdkconfig.defaults` to configure:
-
-- Wi-Fi credentials (if using hardcoded values)
-- BLE parameters
-- Memory allocation settings
-
-### 3. Build and Flash
-
-```bash
-# Build the project
-cargo build --release
-
-# Flash to ESP32-C6
-cargo espflash flash --release --port /dev/ttyUSB0
-
-# Monitor serial output
-cargo espflash monitor --port /dev/ttyUSB0
-```
-
-### 4. Web Interface Access
-
-1. Find the ESP32-C6's IP address from serial output
-2. Open `http://[ESP_IP]:8081` in your browser
-3. The WebSocket connection uses port 8080
-
-## Architecture
-
-### Module Structure
+### Core Application (`src/`)
 
 ```
 src/
-├── main.rs           # Application entry point
-├── lib.rs            # Module declarations
-├── controller.rs     # Main application controller
-├── ble.rs            # BLE scale communication
-├── websocket.rs      # WebSocket server and web UI
-├── relay.rs          # HTTP relay control
-├── state.rs          # System state management
-├── safety.rs         # Safety and watchdog systems
-├── protocol.rs       # BLE protocol implementation
-├── auto_tare.rs      # Auto-tare state machine
-├── brew_states.rs    # Brewing state tracking
-├── overshoot.rs      # Predictive control and learning
-└── types.rs          # Common data structures
+├── main.rs              # Application entry point
+├── lib.rs               # Module declarations  
+├── controller.rs        # Main system orchestrator
+├── state.rs             # Thread-safe state management
+├── types.rs             # Shared data structures
+```
+
+### Hardware Integration (`src/hardware/`)
+
+```
+hardware/
+├── mod.rs              # Hardware module exports
+├── relay.rs            # GPIO relay control (GPIO19)
+└── display.rs          # Future display support
+```
+
+### Scale Integration (`src/scales/`)
+
+```
+scales/
+├── mod.rs              # Scale module exports
+├── bookoo.rs           # Bookoo Themis Mini implementation
+├── protocol.rs         # BLE protocol parsing
+├── traits.rs           # Scale abstraction layer
+├── event_detection.rs  # Scale button/timer detection
+└── simple_scanner.rs   # Generic BLE scale discovery
+```
+
+### Brewing Logic (`src/brewing/`)
+
+```
+brewing/
+├── mod.rs              # Brewing module exports
+├── controller.rs       # Brewing state machine controller
+├── states.rs           # Comprehensive state machine (statig-based)
+├── auto_tare.rs        # Auto-tare state management
+└── overshoot.rs        # Predictive control algorithms
+```
+
+### System Management (`src/system/`)
+
+```
+system/
+├── mod.rs              # System module exports
+├── events.rs           # Event bus and system events
+├── safety.rs           # Safety controllers and emergency stop
+├── storage.rs          # NVS persistent storage
+└── config.rs           # Configuration management
+```
+
+### Networking (`src/wifi/` & `src/server/`)
+
+```
+wifi/
+├── mod.rs              # WiFi module exports
+├── manager.rs          # WiFi connection management
+└── provisioning.rs     # WiFi credential provisioning
+
+server/
+├── mod.rs              # Server module exports
+└── http.rs             # HTTP/WebSocket server
+```
+
+### BLE Communication (`src/ble.rs`)
+
+Generic BLE client with ESP32-C6 NimBLE integration supporting:
+- Device scanning and filtering
+- Service/characteristic discovery  
+- Notification subscriptions
+- Connection management
+
+## Architecture Overview
+
+### Event-Driven State Machine
+
+The core architecture uses a unified state machine (`brewing/states.rs`) with:
+
+- **Pure State Logic**: All decisions made in state machine
+- **Side Effect Outputs**: Hardware actions as state machine outputs
+- **Event Bus**: Type-safe event communication between components
+- **Superstates**: Logical grouping (ScaleConnected, ActiveBrewing, etc.)
+
+```rust
+// Example: Scale data flows through state machine
+ScaleData -> BrewStateMachine -> [RelayOn, TareRequested] -> Hardware
 ```
 
 ### Key Components
 
-| Component            | Description                                          |
-| -------------------- | ---------------------------------------------------- |
-| `EspressoController` | Main orchestrator managing all subsystems            |
-| `BleScaleClient`     | Handles BLE connection and protocol communication    |
-| `WebSocketServer`    | Provides real-time web interface                     |
-| `RelayController`    | Manages GPIO-based relay control (GPIO19)            |
-| `SafetyController`   | Implements multiple safety mechanisms                |
-| `StateManager`       | Centralized state management with thread-safe access |
+| Component | Purpose | Location |
+|-----------|---------|----------|
+| `EspressoController` | System orchestrator | `controller.rs` |
+| `BrewStateMachine` | Core brewing logic | `brewing/states.rs` |
+| `BrewController` | State machine wrapper | `brewing/controller.rs` |
+| `BookooScale` | Scale communication | `scales/bookoo.rs` |
+| `SimpleScaleScanner` | Scale discovery | `scales/simple_scanner.rs` |
+| `EventBus` | System-wide events | `system/events.rs` |
+| `StateManager` | Shared state | `state.rs` |
+| `RelayController` | Hardware control | `hardware/relay.rs` |
 
-### Communication Flow
+### Data Flow
 
-1. BLE scale data → Protocol parsing → State updates
-2. State changes → Brewing logic → Relay control
-3. Web interface ← WebSocket ← State updates
-4. User commands → WebSocket → Controller actions
+1. **Scale Data**: BLE → Protocol Parsing → State Machine → Brewing Logic
+2. **User Commands**: Web UI → WebSocket → Event Bus → State Machine  
+3. **Hardware Control**: State Machine → Side Effects → Relay/BLE Commands
+4. **State Updates**: State Machine → State Manager → Web UI (via WebSocket)
 
-## BLE Protocol
+## State Machine Architecture
 
-The system implements the Bookoo Themis Mini's proprietary BLE protocol:
+### Core States
 
-- **Service UUID**: `0000ffe0-0000-1000-8000-00805f9b34fb`
-- **Weight Data**: `0000ff11-0000-1000-8000-00805f9b34fb`
-- **Commands**: `0000ff12-0000-1000-8000-00805f9b34fb`
+- **SystemInit**: Initial startup and hardware detection
+- **ScaleConnected**: Scale connected, ready for brewing
+- **ActiveBrewing**: Timer running, weight-based control active
+- **BrewingComplete**: Settling period after brewing stops
 
-### Supported Commands
+### Advanced Features
 
-- Tare: `[0x03, 0x0A, 0x01, 0x00, 0x00, 0x08]`
-- Start Timer: `[0x03, 0x0A, 0x04, 0x00, 0x00, 0x0A]`
-- Stop Timer: `[0x03, 0x0A, 0x05, 0x00, 0x00, 0x0D]`
-- Reset Timer: `[0x03, 0x0A, 0x06, 0x00, 0x00, 0x0C]`
-
-## Safety Features
-
-### Critical Safety Systems
-
-1. **Emergency Stop**: Immediate relay shutdown on any fault
-2. **BLE Watchdog**: Monitors connection and data flow
-3. **Timer Validation**: Ensures relay state matches timer state
-4. **Error Recovery**: Automatic retry and graceful degradation
-
-### Fail-Safe Conditions
-
-- BLE disconnection during brewing
-- Network connectivity loss
-- Data parsing errors
-- Watchdog timeouts
-- Manual emergency stop
-
-## Configuration Options
-
-### Default Settings
-
-- **Target Weight**: 36.0g
-- **Auto-Tare**: Enabled
-- **Predictive Stop**: Enabled
-- **Relay GPIO**: GPIO19 (active high)
-
-### Adjustable Parameters
-
-- Target weight (1-100g)
-- Auto-tare sensitivity and timing
-- Predictive stop margins
-- Safety timeout values
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Scale Not Found**: Ensure scale is powered and in pairing mode
-2. **Web Interface Unreachable**: Check Wi-Fi connection and IP address
-3. **Relay Not Responding**: Check GPIO19 wiring and use test relay function
-4. **Predictive Stop Issues**: Reset overshoot learning data
-
-### Debug Information
-
-- Serial console provides detailed logging
-- Web interface shows system status and recent log messages
-- BLE connection status and data flow indicators
+- **Auto-Tare State Machine**: Detects object placement/removal patterns
+- **Overshoot Control**: EWMA-based learning algorithm for predictive stopping
+- **Scale Event Detection**: Infers scale button presses from data patterns
+- **Safety Systems**: Multiple watchdogs and emergency stop mechanisms
 
 ## Development
 
 ### Build Commands
 
 ```bash
-# Debug build
+# Development build
 cargo build
 
-# Release build (optimized for size)
+# Release build (optimized for ESP32)
 cargo build --release
 
-# Check without building
+# Check code without building  
 cargo check
 
-# Format code
-cargo fmt
-
-# Run clippy lints
-cargo clippy
+# Format and lint
+cargo fmt && cargo clippy
 ```
 
-### Testing
+### ESP32 Flashing
 
 ```bash
-# Run unit tests
-cargo test
+# Flash firmware
+cargo espflash flash --release --port /dev/ttyUSB0
 
-# Run with specific ESP-IDF target
-cargo build --target xtensa-esp32s3-espidf
+# Monitor serial output
+cargo espflash monitor --port /dev/ttyUSB0
 ```
+
+### Configuration Files
+
+- `sdkconfig.defaults`: ESP-IDF configuration (BLE, WiFi, memory)
+- `Cargo.toml`: Rust dependencies and ESP32 target configuration
+- `CLAUDE.md`: Development guidelines and architecture notes
+
+## BLE Protocol (Bookoo Themis Mini)
+
+- **Service**: `0000ffe0-0000-1000-8000-00805f9b34fb`
+- **Weight Data**: `0000ff11-0000-1000-8000-00805f9b34fb` (notifications)
+- **Commands**: `0000ff12-0000-1000-8000-00805f9b34fb` (write)
+
+### Scale Commands
+
+| Command | Bytes | Function |
+|---------|-------|----------|
+| Tare | `[0x03, 0x0A, 0x01, 0x00, 0x00, 0x08]` | Zero scale |
+| Start Timer | `[0x03, 0x0A, 0x04, 0x00, 0x00, 0x0A]` | Start brewing timer |
+| Stop Timer | `[0x03, 0x0A, 0x05, 0x00, 0x00, 0x0D]` | Stop brewing timer |
+| Reset Timer | `[0x03, 0x0A, 0x06, 0x00, 0x00, 0x0C]` | Reset timer to zero |
+
+## Web Interface
+
+Access at `http://[ESP_IP]:8081` for:
+- Real-time weight and flow rate monitoring
+- Brewing parameter configuration  
+- Manual scale commands (tare, timer control)
+- System status and diagnostics
+- Overshoot learning management
+
+## Safety Features
+
+- **Emergency Stop**: Immediate relay shutdown on any fault condition
+- **BLE Watchdog**: Monitors scale connection and data flow
+- **State Validation**: Ensures consistent system state
+- **Graceful Degradation**: Continues operation with reduced functionality
+- **Hardware Fail-Safe**: Machine works normally if ESP32 is disconnected
+
+## Future Extensibility
+
+The architecture supports:
+- **Multi-Scale Support**: Generic scanner can detect different scale brands
+- **Additional Hardware**: Display modules, sensors, etc.
+- **Enhanced Algorithms**: More sophisticated brewing control logic
+- **Cloud Integration**: Data logging and remote monitoring
+- **Mobile Apps**: Native mobile interfaces
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT License - See LICENSE file for details.
 
 ## Acknowledgments
 
-- Bookoo Coffee for the Themis Mini scale and protocol documentation
-- ESP-RS community for ESP32 Rust tooling
-- Embassy for async embedded framework
+Built with ESP-RS ecosystem, Embassy async framework, and the Rust embedded community.

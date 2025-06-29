@@ -36,8 +36,8 @@ pub struct ScaleInfo {
 
 // Status channel for connection state
 pub type StatusChannel = Channel<CriticalSectionRawMutex, bool, 2>;
-pub type ScaleDataChannel = Channel<CriticalSectionRawMutex, ScaleData, 10>;
-pub type ScaleCommandChannel = Channel<CriticalSectionRawMutex, ScaleCommand, 5>;
+pub type ScaleDataChannel = Channel<CriticalSectionRawMutex, ScaleData, 50>; // 5 seconds buffer at 10Hz
+pub type ScaleCommandChannel = Channel<CriticalSectionRawMutex, ScaleCommand, 20>; // More command buffer
 
 /// Main trait that all smart scales must implement
 /// This trait is object-safe to support dynamic dispatch

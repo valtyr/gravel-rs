@@ -203,6 +203,15 @@ impl EspressoController {
             warn!("Failed to spawn WebSocket task - continuing without HTTP server");
         }
 
+        // Spawn scale data bridge task (CRITICAL - bridges scale data to event bus)
+        spawner
+            .spawn(scale_data_bridge_task(
+                Arc::clone(&self.scale_data_channel),
+                Arc::clone(&self.ble_status_channel),
+                Arc::clone(&self.event_bus),
+            ))
+            .map_err(|_| "Failed to spawn scale data bridge task")?;
+
         // 🚀 Run the WORLD-CLASS event-driven control loop!
         self.event_driven_control_loop().await;
 
@@ -558,7 +567,13 @@ impl EspressoController {
                         .await;
                 }
 
-                // Check settling timeout
+                // Send tick to brewing state machine for time-based logic
+                let tick_outputs = self.brew_controller.handle_input(BrewInput::Tick);
+                for output in tick_outputs {
+                    self.handle_brew_output(output).await;
+                }
+
+                // Check settling timeout (legacy - now handled by state machine)
                 let settling_outputs = self.brew_controller.check_settling_timeout();
                 for output in settling_outputs {
                     self.handle_brew_output(output).await;
@@ -719,10 +734,8 @@ impl EspressoController {
                 "🎯 Target reached: {:.1}g >= {:.1}g at {}ms",
                 scale_data.weight_g, target_weight, scale_data.timestamp_ms
             );
-            if let Err(e) = self.stop_brewing_with_reason("target_reached").await {
-                error!("Failed to stop brewing: {:?}", e);
-                self.emergency_stop().await;
-            }
+            // LEGACY: Direct brewing control replaced by state machine
+            self.stop_brewing_with_reason("target_reached").await;
             return;
         }
 
@@ -859,51 +872,47 @@ impl EspressoController {
             }
 
             WebSocketCommand::TareScale => {
-                if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::Tare) {
-                    warn!("Failed to send tare command - channel full");
-                    self.state_manager
-                        .add_log("Failed to send tare command".to_string())
-                        .await;
-                } else {
-                    self.state_manager
-                        .add_log("Tare command sent to scale".to_string())
-                        .await;
+                // Route through state machine instead of direct command
+                let outputs = self.brew_controller.handle_input(BrewInput::UserCommand(UserEvent::TareScale));
+                for output in outputs {
+                    self.handle_brew_output(output).await;
                 }
+                self.state_manager
+                    .add_log("Tare command routed through state machine".to_string())
+                    .await;
             }
 
             WebSocketCommand::StartTimer => {
-                if let Err(_) = self
-                    .scale_command_channel
-                    .try_send(ScaleCommand::StartTimer)
-                {
-                    warn!("Failed to send start timer command - channel full");
-                } else {
-                    self.state_manager
-                        .add_log("Start timer command sent to scale".to_string())
-                        .await;
+                // Route through state machine instead of direct command
+                let outputs = self.brew_controller.handle_input(BrewInput::UserCommand(UserEvent::StartBrewing));
+                for output in outputs {
+                    self.handle_brew_output(output).await;
                 }
+                self.state_manager
+                    .add_log("Start brewing command routed through state machine".to_string())
+                    .await;
             }
 
             WebSocketCommand::StopTimer => {
-                if let Err(e) = self.stop_brewing().await {
-                    error!("Failed to stop brewing: {:?}", e);
+                // Route through state machine instead of direct command
+                let outputs = self.brew_controller.handle_input(BrewInput::UserCommand(UserEvent::StopBrewing));
+                for output in outputs {
+                    self.handle_brew_output(output).await;
                 }
+                self.state_manager
+                    .add_log("Stop brewing command routed through state machine".to_string())
+                    .await;
             }
 
             WebSocketCommand::ResetTimer => {
-                if let Err(_) = self
-                    .scale_command_channel
-                    .try_send(ScaleCommand::ResetTimer)
-                {
-                    warn!("Failed to send reset timer command - channel full");
-                } else {
-                    self.state_manager
-                        .add_log("Reset timer command sent to scale".to_string())
-                        .await;
+                // Route through state machine instead of direct command
+                let outputs = self.brew_controller.handle_input(BrewInput::UserCommand(UserEvent::ResetTimer));
+                for output in outputs {
+                    self.handle_brew_output(output).await;
                 }
-                // TODO: Replace with proper BrewController emergency stop
-                // self.brew_controller.emergency_stop();
-                self.state_manager.update_brew_state(BrewState::Idle).await;
+                self.state_manager
+                    .add_log("Reset timer command routed through state machine".to_string())
+                    .await;
             }
 
             WebSocketCommand::ResetOvershoot => {
@@ -938,10 +947,8 @@ impl EspressoController {
                 self.pending_stop_time = None;
 
                 if self.state_manager.get_timer_state().await == TimerState::Running {
-                    if let Err(e) = self.stop_brewing_with_reason("predicted").await {
-                        error!("Failed to execute predictive stop: {:?}", e);
-                        self.emergency_stop().await;
-                    }
+                    // LEGACY: Direct brewing control replaced by state machine
+                    self.stop_brewing_with_reason("predicted").await;
                 } else {
                     info!("Predictive stop cancelled - timer no longer running");
                 }
@@ -949,11 +956,11 @@ impl EspressoController {
         }
     }
 
-    async fn stop_brewing(&mut self) -> Result<(), RelayError> {
+    async fn stop_brewing(&mut self) {
         self.stop_brewing_with_reason("manual").await
     }
 
-    async fn stop_brewing_with_reason(&mut self, reason: &str) -> Result<(), RelayError> {
+    async fn stop_brewing_with_reason(&mut self, reason: &str) {
         info!("Stopping brewing ({})", reason);
 
         // Cancel pending stop task
@@ -964,20 +971,20 @@ impl EspressoController {
         // Overshoot learning is now handled by the state machine
         debug!("Overshoot learning now handled by state machine");
 
-        // Send stop command for automatic stops (like Python)
-        if reason == "target_reached" || reason == "predicted" {
-            if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::StopTimer) {
-                warn!("Failed to send stop timer command - channel full");
-            }
-        }
+        // LEGACY: Direct scale commands removed - now handled by state machine
+        // The state machine now handles all scale commands as side effects
+        // if reason == "target_reached" || reason == "predicted" {
+        //     if let Err(_) = self.scale_command_channel.try_send(ScaleCommand::StopTimer) {
+        //         warn!("Failed to send stop timer command - channel full");
+        //     }
+        // }
 
-        self.relay_controller.turn_off().await?;
-        self.state_manager.set_relay_enabled(false).await;
+        // LEGACY: Direct relay control removed - now handled by state machine
+        // self.relay_controller.turn_off().await?;
+        // self.state_manager.set_relay_enabled(false).await;
         self.state_manager
             .add_log(format!("Brewing stopped ({})", reason))
             .await;
-
-        Ok(())
     }
 
     async fn emergency_stop(&mut self) {
@@ -1134,6 +1141,14 @@ impl EspressoController {
                     )))
                     .await;
             }
+            BrewOutput::ResetTimer => {
+                info!("🔄 State machine output: ResetTimer -> Publishing hardware event");
+                self.get_event_publisher()
+                    .publish(SystemEvent::Hardware(HardwareEvent::SendScaleCommand(
+                        ScaleCommand::ResetTimer,
+                    )))
+                    .await;
+            }
             BrewOutput::BrewingStarted => {
                 info!("☕ Brewing started");
                 self.state_manager
@@ -1261,6 +1276,30 @@ impl EspressoController {
                     .add_log("Overshoot controller reset".to_string())
                     .await;
             }
+            BrewOutput::StartWifiProvisioning => {
+                info!("📱 State machine output: StartWifiProvisioning -> Starting WiFi provisioning");
+                // TODO: Implement WiFi provisioning start
+            }
+            BrewOutput::StopWifiProvisioning => {
+                info!("📱 State machine output: StopWifiProvisioning -> Stopping WiFi provisioning");
+                // TODO: Implement WiFi provisioning stop
+            }
+            BrewOutput::WifiProvisioningStatusChanged { active, device_name } => {
+                info!("📱 WiFi provisioning status: active={}, device={:?}", active, device_name);
+                // TODO: Update UI with provisioning status
+            }
+            BrewOutput::ResetWifiCredentials => {
+                info!("🔄 State machine output: ResetWifiCredentials -> Resetting WiFi credentials");
+                // TODO: Implement WiFi credentials reset
+            }
+            BrewOutput::ConnectToWifi { ssid, password } => {
+                info!("📶 State machine output: ConnectToWifi -> Connecting to SSID: {}", ssid);
+                // TODO: Implement WiFi connection with credentials
+            }
+            BrewOutput::DisconnectWifi => {
+                info!("📶 State machine output: DisconnectWifi -> Disconnecting from WiFi");
+                // TODO: Implement WiFi disconnection
+            }
         }
     }
 }
@@ -1273,6 +1312,45 @@ async fn scale_task(mut scale_client: BookooScale, command_channel: Arc<ScaleCom
     // Start scale client with command channel support
     if let Err(e) = scale_client.start_with_commands(command_channel).await {
         error!("Scale task error: {:?}", e);
+    }
+}
+
+#[embassy_executor::task]
+async fn scale_data_bridge_task(
+    scale_data_channel: Arc<ScaleDataChannel>,
+    ble_status_channel: Arc<StatusChannel>,
+    event_bus: Arc<EventBus>,
+) {
+    info!("🌉 Scale data bridge task started - connecting scale data to event bus");
+    
+    let event_publisher = event_bus.publisher();
+    
+    loop {
+        let scale_data_fut = scale_data_channel.receive();
+        let ble_status_fut = ble_status_channel.receive();
+        
+        match select(scale_data_fut, ble_status_fut).await {
+            Either::First(scale_data) => {
+                // Convert scale data to scale event and publish
+                event_publisher
+                    .publish(SystemEvent::Scale(ScaleEvent::WeightChanged { data: scale_data }))
+                    .await;
+            }
+            Either::Second(ble_connected) => {
+                // Convert BLE status to network event and publish
+                if ble_connected {
+                    event_publisher
+                        .publish(SystemEvent::Network(NetworkEvent::BleConnected { 
+                            device_name: "Bookoo Scale".to_string() 
+                        }))
+                        .await;
+                } else {
+                    event_publisher
+                        .publish(SystemEvent::Network(NetworkEvent::BleDisconnected))
+                        .await;
+                }
+            }
+        }
     }
 }
 

@@ -84,6 +84,10 @@ pub enum UserEvent {
     TestRelay,
     ResetOvershoot,
     
+    // WiFi provisioning
+    StartWifiProvisioning,
+    ResetWifiCredentials,
+    
     // System control
     EmergencyStop,
     RebootSystem,
